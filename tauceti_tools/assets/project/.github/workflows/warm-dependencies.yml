@@ -1,0 +1,81 @@
+name: Warm official dependencies
+
+# A main-only producer: no candidate source, Lake build or publication credential
+# runs in this job. Downstream caches are repository-scoped, so each project
+# needs its own producer rather than relying on TauCeti's snapshot cache.
+on:
+  push:
+    branches: [main]
+    paths:
+      - lean-toolchain
+      - .github/workflows/warm-dependencies.yml
+      - .github/actions/restore-lean-toolchain/**
+      - scripts/toolchain_snapshot.py
+      - tauceti.toml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: official-lean-snapshot
+  cancel-in-progress: false
+
+jobs:
+  warm:
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Check out immutable main tooling and release pin
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.workflow_sha }}
+          persist-credentials: false
+
+      - name: Prepare pinned shared tools
+        uses: __TOOLS_REPO__/.github/actions/setup@__TOOLS_REF__
+        with:
+          tools-repository: __TOOLS_REPO__
+          tools-ref: __TOOLS_REF__
+          project-directory: .
+
+      - name: Install pinned and checksum-verified elan
+        env:
+          ELAN_VER: v4.2.3
+          ELAN_SHA256: df0b2b3a439961ffcbb3985214365ffe40f49bc871df04dff268c7d8e21ca8b2
+        run: |
+          set -euo pipefail
+          curl -sSL -H "Accept: application/octet-stream" \
+            "https://github.com/leanprover/elan/releases/download/${ELAN_VER}/elan-x86_64-unknown-linux-gnu.tar.gz" -o elan.tar.gz
+          echo "${ELAN_SHA256}  elan.tar.gz" | sha256sum -c -
+          tar -xzf elan.tar.gz elan-init
+          ./elan-init -y --default-toolchain none
+          rm -f elan.tar.gz elan-init
+          echo "$HOME/.elan/bin" >> "$GITHUB_PATH"
+
+      - name: Restore or install the exact official Lean release
+        id: toolchain
+        uses: ./.github/actions/restore-lean-toolchain
+        with:
+          project-dir: .
+          tooling-dir: .
+
+      - name: Seal official files before any project code executes
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        env:
+          ROOT: ${{ steps.toolchain.outputs.path }}
+          PRODUCER_REVISION: ${{ github.workflow_sha }}
+          PRODUCER_RUN: ${{ github.run_id }}
+        run: |
+          set -euo pipefail
+          python3 scripts/toolchain_snapshot.py seal lean-toolchain --root "$ROOT" \
+            --revision "$PRODUCER_REVISION" --run-id "$PRODUCER_RUN"
+          python3 scripts/toolchain_snapshot.py verify lean-toolchain --root "$ROOT"
+
+      - name: Save only the sealed official toolchain
+        if: steps.toolchain.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ steps.toolchain.outputs.path }}
+          key: ${{ steps.toolchain.outputs.key }}

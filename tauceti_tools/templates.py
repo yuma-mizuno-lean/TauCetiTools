@@ -335,6 +335,10 @@ def write_project(project: Project, checkout: Path, role: str = "content") -> li
         if not source.is_file() or "__pycache__" in source.parts or source.suffix == ".pyc":
             continue
         relative = source.relative_to(ASSETS / "project")
+        if project.legacy and relative.as_posix() == ".github/workflows/warm-dependencies.yml":
+            # TauCeti already owns a richer Lean/Mathlib/capacity producer.
+            # This small producer fills a downstream setup gap only.
+            continue
         if not project.legacy and relative.name in ("publication_capacity_fixture.json", "stack_policy_fixtures.json"):
             continue  # Infrastructure test fixtures belong to Tools, not downstream policy.
         if not project.legacy and relative.parts[0] == "scripts" and source.suffix not in (".lean", ".txt", ".json"):
