@@ -1069,6 +1069,12 @@ jobs:
           LAKE_CACHE_MAX_REVS: ${{ env.TOOLCHAIN_CHANGED == '1' && '1' || '1000' }}
         run: bash gate/scripts/lake-cache-get.sh pr
 
+      # Opt-in downstream transport. Execute only workflow-pinned policy code;
+      # the candidate's copy is never executed on the host.
+      - name: Restore downstream Lake release cache
+        if: ${{ env.INFRA != '1' && vars.MEI_RELEASE_CACHE == '1' && github.repository == 'yuma-mizuno-lean/Mei' }}
+        run: python3 gate/scripts/mei_release_cache.py restore pr || test "$?" = 2
+
       - name: Save verified Lake archive records before candidate code runs
         if: ${{ env.INFRA != '1' && env.STAGE_LAKE_CACHE == '1' }}
         # gate/ is mounted read-only below. Candidate builds overwrite the live
