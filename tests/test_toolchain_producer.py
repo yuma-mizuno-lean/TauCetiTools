@@ -82,6 +82,15 @@ class DownstreamToolchainProducerTests(unittest.TestCase):
                 with self.assertRaises(ValueError):
                     snapshot.verify(release, pin)
 
+    def test_existing_tauceti_dependency_warmer_is_not_replaced(self):
+        self.project.raw["repositories"]["content"] = "TauCetiProject/TauCeti"
+        path = self.checkout / ".github/workflows/warm-dependencies.yml"
+        original = "existing main-only Lean, Mathlib and capacity producer\n"
+        path.write_text(original)
+        changed = write_project(self.project, self.checkout)
+        self.assertEqual(path.read_text(), original)
+        self.assertNotIn(".github/workflows/warm-dependencies.yml", changed)
+
 
 if __name__ == "__main__":
     unittest.main()
