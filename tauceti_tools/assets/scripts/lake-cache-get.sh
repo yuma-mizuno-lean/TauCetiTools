@@ -120,3 +120,7 @@ if [ "$clean" != 1 ]; then
     echo "LAKE_CACHE_DIR="
   } >> "${GITHUB_ENV:-/dev/null}"
 fi
+
+# Use the pinned dependencies' public caches as well as the root package's.
+# Materialization supplies endpoints only from the trusted project policy.
+python3 "$(dirname "$0")/lake_dependency_cache.py" "$PROJECT_DIR"
