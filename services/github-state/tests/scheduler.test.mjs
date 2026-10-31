@@ -576,10 +576,32 @@ test('existing init fragments are rebuilt from cached comments without GitHub re
   await state.maintenance();
   assert.equal(JSON.parse(await state.projectedSurvey('7')).meta.head_sha,'old');
   const marker=(await db.prepare('SELECT contract FROM survey_hydrated WHERE number=?').get('7')).contract;
-  assert.equal(marker,'tauceti-survey-facts/v1:completed-scoreboards');
+  assert.equal(marker,'tauceti-survey-facts/v1:completed-scoreboards-mei-rebase');
   assert.equal((await state.surveyHealth()).contract,'tauceti-survey-facts/v1','public contract remains compatible');
   await state.prepareDiagnostics();
   assert.equal(state.diagnostics.survey.hydrated,1,'prepared health uses the internal index marker');
   assert.equal(state.diagnostics.survey.contract,'tauceti-survey-facts/v1');
+ }finally{globalThis.fetch=oldFetch;await db.close();}
+});
+
+test('cached Mei recovery requests are reprojected without GitHub reads',async()=>{
+ const {state,db}=await fixture(),oldFetch=globalThis.fetch;
+ globalThis.fetch=async(...args)=>{
+  if(new URL(String(args[0]?.url ?? args[0])).hostname==='api.github.com')throw Error('recovery migration must not read GitHub');
+  return oldFetch(...args);
+ };
+ try {
+  const head='e53dccb6abd43a803fb90a84e8b4aee50fc16f7e';
+  await state.setMeta('repository',{id:'100',name:'org/repo',installation:'200'});
+  await state.put('pr','7',{number:7,state:'OPEN',headRefOid:head,labels:[{name:'needs-rebase'}]});
+  await state.membership('open_prs:{}','7',true);
+  const row={id:'102',updated_at:'102',user:{login:'mei-automation[bot]'},body:'Merge-queue recovery for head `e53dccb`: integration repair\n\n<!--tauceti-rebase:v1 '+head+'-->'};
+  await state.put('issue_comments',row.id,row,Date.now(),false,'7');
+  await state.membership('issue_comments:{"number":7}',row.id,true);
+  await db.prepare('INSERT INTO survey_fragments VALUES(?,?,?,?) ON CONFLICT(kind,id) DO UPDATE SET parent=excluded.parent,data=excluded.data').run('issue_comments',row.id,'7',JSON.stringify({id:row.id,updated:row.updated_at,meta:null,rebase_heads:[]}));
+  await db.prepare('INSERT INTO survey_hydrated VALUES(?,?) ON CONFLICT(number) DO UPDATE SET contract=excluded.contract').run('7','tauceti-survey-facts/v1:completed-scoreboards');
+  assert.deepEqual(JSON.parse(await state.projectedSurvey('7')).rebase_heads,[]);
+  await state.maintenance();
+  assert.deepEqual(JSON.parse(await state.projectedSurvey('7')).rebase_heads,[head]);
  }finally{globalThis.fetch=oldFetch;await db.close();}
 });
