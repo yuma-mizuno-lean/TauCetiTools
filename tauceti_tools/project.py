@@ -283,6 +283,12 @@ def _validate(raw: dict, source: str) -> Project:
         if not isinstance(upstream, dict):
             raise ConfigError("upstreams must be an array of tables")
         repository(upstream.get("repo", ""), "upstreams.repo")
+        cache_keys = ("cache_artifact_url", "cache_revision_url")
+        if any(upstream.get(key) for key in cache_keys):
+            for key in cache_keys:
+                url = urllib.parse.urlsplit(upstream.get(key, ""))
+                if url.scheme != "https" or not url.hostname or url.username or url.password:
+                    raise ConfigError(f"upstreams.{key} must be an HTTPS URL without credentials")
         if not isinstance(upstream.get("package"), str) or not re.fullmatch(r"[A-Za-z0-9_-]+", upstream["package"]):
             raise ConfigError("each upstream requires a Lake package name")
     backend = _table(raw, "merge").get("backend", "github-queue")

@@ -219,6 +219,9 @@ def materialize(project: Project, destination: Path, *, policy_dir: Path | None 
         except UnicodeError:
             shutil.copyfile(source, target)
         else:
+            if source.name == "lake_dependency_cache.py":
+                dependencies = [u for u in project.raw.get("upstreams", []) if u.get("cache_artifact_url")]
+                content = content.replace("DEPENDENCIES = []", "DEPENDENCIES = " + repr(dependencies))
             target.write_text(content)
         target.chmod(source.stat().st_mode & 0o777)
     for name, contents in policies:
@@ -381,6 +384,8 @@ def write_project(project: Project, checkout: Path, role: str = "content") -> li
                 r"(?ms)^      - name: (?:Infrastructure policy unit tests|Lake archive reuse integration tests|Header audit equivalence tests)\n.*?(?=^      - |^  [a-z]|\Z)", "", text)
             text = text.replace("needs: [build, duplicate-audit-tests]", "needs: [build]")
             text = text.replace(" && needs['duplicate-audit-tests'].result == 'success'", "")
+        if relative.name == "pr-build.yml" and project.service("cache").get("ci_bundle", False):
+            text = text.replace("      lean_root:", "      lake_cache_bundle: true\n      lean_root:")
         if relative.name == "pr-status.yml" and not project.feature("zulip"):
             text = text.replace('args=(--since', 'args=(--labels-only --since')
             text = text.replace("Reconcile labels and Zulip posts", "Reconcile PR status labels")

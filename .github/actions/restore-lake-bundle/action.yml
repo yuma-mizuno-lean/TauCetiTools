@@ -1,0 +1,43 @@
+name: Restore one trusted Lake cache bundle
+description: Restore a bounded main-built bundle; never fetch individual root artifacts from R2.
+inputs:
+  project-dir:
+    required: true
+  package:
+    required: true
+  script:
+    required: true
+outputs:
+  key:
+    value: ${{ steps.config.outputs.key }}
+  archive:
+    value: ${{ steps.config.outputs.archive }}
+runs:
+  using: composite
+  steps:
+    - id: config
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project-dir }}
+        PACKAGE: ${{ inputs.package }}
+        PREFIX: lake-bundle-v1-${{ inputs.package }}-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles(format('{0}/lean-toolchain', inputs.project-dir)) }}-
+      run: |
+        echo "prefix=$PREFIX" >> "$GITHUB_OUTPUT"
+        echo "key=$PREFIX$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+        echo "archive=$RUNNER_TEMP/lake-bundle/cache.tar" >> "$GITHUB_OUTPUT"
+        echo "LAKE_CACHE_DIR=$GITHUB_WORKSPACE/$PROJECT/.lake/cache" >> "$GITHUB_ENV"
+        echo "LAKE_ARTIFACT_CACHE=true" >> "$GITHUB_ENV"
+        echo "LAKE_RESTORE_ARTIFACTS=true" >> "$GITHUB_ENV"
+    - uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830
+      with:
+        path: ${{ steps.config.outputs.archive }}
+        key: ${{ steps.config.outputs.key }}
+        restore-keys: ${{ steps.config.outputs.prefix }}
+    - name: Validate and unpack standard Lake records offline
+      shell: bash
+      env:
+        PROJECT: ${{ inputs.project-dir }}
+        PACKAGE: ${{ inputs.package }}
+        SCRIPT: ${{ inputs.script }}
+        ARCHIVE: ${{ steps.config.outputs.archive }}
+      run: python3 "$SCRIPT" restore "$PROJECT" "$ARCHIVE" --package "$PACKAGE"
