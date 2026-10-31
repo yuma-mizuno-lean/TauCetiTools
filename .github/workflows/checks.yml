@@ -3,12 +3,11 @@ on: [push, pull_request]
 permissions:
   contents: read
 jobs:
-  # Reuse small Namespace runners rather than queue release fixes behind GitHub builds.
-  # Leave priority unspecified so Bors control (0) and staging builds (1) go first.
+  # Upstream reuses its Namespace runners; forks need no Namespace installation.
+  # Keep the same checks on standard hosted runners in forks. Upstream leaves
+  # priority unspecified so Bors control (0) and staging builds (1) go first.
   package:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ${{ fromJSON(github.repository_owner == 'TauCetiProject' && format('["nscloud-ubuntu-24.04-amd64-2x4-with-features","namespace-features:github.run-id={0}"]', github.run_id) || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
@@ -17,9 +16,7 @@ jobs:
       - run: python -m pip install '.[test]'
       - run: python -m unittest discover -s tests -p 'test_*.py'
   github-state:
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ${{ fromJSON(github.repository_owner == 'TauCetiProject' && format('["nscloud-ubuntu-24.04-amd64-2x4-with-features","namespace-features:github.run-id={0}"]', github.run_id) || '["ubuntu-latest"]') }}
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -30,9 +27,7 @@ jobs:
 
   github-state-postgres:
     if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
-    runs-on:
-      - nscloud-ubuntu-24.04-amd64-2x4-with-features
-      - namespace-features:github.run-id=${{ github.run_id }}
+    runs-on: ${{ fromJSON(github.repository_owner == 'TauCetiProject' && format('["nscloud-ubuntu-24.04-amd64-2x4-with-features","namespace-features:github.run-id={0}"]', github.run_id) || '["ubuntu-latest"]') }}
     timeout-minutes: 20
     env:
       # Isolated test-branch credentials only; no Neon API key or production URL.
