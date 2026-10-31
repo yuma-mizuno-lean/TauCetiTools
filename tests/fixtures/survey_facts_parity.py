@@ -66,7 +66,7 @@ def cases():
             {
                 "id": "99",
                 "body": "Merge-queue recovery for head `x`\r\n<!--tauceti-rebase:v1 " + "a" * 40 + "-->\r\n",
-                "user": {"login": "tauceti-review-bot[bot]"},
+                "user": {"login": rng.choice(["tauceti-review-bot[bot]", "tau-ceti-bors[bot]", "mei-automation[bot]", "untrusted[bot]"])},
                 "updated_at": "4",
             }
         )

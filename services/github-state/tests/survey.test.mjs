@@ -6,6 +6,18 @@ import {runtime,repository,response,send} from './runtime.mjs';
 
 const bundle=await build({entryPoints:['src/survey.ts'],bundle:true,platform:'node',format:'esm',write:false});
 const facts=await import('data:text/javascript;base64,'+Buffer.from(bundle.outputFiles[0].text).toString('base64'));
+test('Mei recovery uses the same exact-head handoff contract as Tau Ceti',()=>{
+ const head='e53dccb6abd43a803fb90a84e8b4aee50fc16f7e';
+ const comment=(login,sha=head)=>({id:'1',user:{login},body:'Merge-queue recovery for head `e53dccb`: integration repair\n\n<!--tauceti-rebase:v1 '+sha+'-->'});
+ for(const login of ['mei-automation[bot]','tauceti-review-bot[bot]','tau-ceti-bors[bot]'])
+  assert.deepEqual(facts.summarize([comment(login)],[]).rebase_heads,[head]);
+ for(const login of ['mei-automation','untrusted[bot]','author','MEI-AUTOMATION[bot]'])
+  assert.deepEqual(facts.summarize([comment(login)],[]).rebase_heads,[]);
+ for(const sha of ['e53dccb',head.toUpperCase(),'g'.repeat(40)])
+  assert.deepEqual(facts.summarize([comment('mei-automation[bot]',sha)],[]).rebase_heads,[]);
+ const quoted=comment('mei-automation[bot]');quoted.body='Quoted\n'+quoted.body;
+ assert.deepEqual(facts.summarize([quoted],[]).rebase_heads,[]);
+});
 test('Python fallback and TypeScript projection agree on 240 changing histories and scopes',()=>{
  const process=spawnSync('python3',['../../tests/fixtures/survey_facts_parity.py'],{encoding:'utf8',maxBuffer:5000000});
  assert.equal(process.status,0,process.stderr);
