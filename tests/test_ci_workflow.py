@@ -23,6 +23,18 @@ def shell_for(name, workflow=WORKFLOW):
 
 
 class WorkflowIdentityTests(unittest.TestCase):
+    def test_storage_reclamation_runs_after_head_resolution_before_candidate_code(self):
+        source = WORKFLOW.read_text()
+        cleanup = source.index('      - name: Reclaim unused hosted-runner SDK storage before Lean caches')
+        candidate = source.index('      - name: Checkout the exact candidate head')
+        self.assertLess(source.index('      - name: Resolve PR head'), cleanup)
+        self.assertLess(cleanup, candidate)
+        block = source[cleanup:candidate]
+        self.assertIn("runner.environment == 'github-hosted' && runner.os == 'Linux'", block)
+        self.assertIn('TAUCETI_RUNNER_ENVIRONMENT: ${{ runner.environment }}', block)
+        self.assertIn('PYTHONPATH: ${{ github.workspace }}/.tauceti-tools', block)
+        self.assertIn('python3 -m tauceti_tools.ci_runner_storage', block)
+
     def resolve(self, event, *, git_fails=False, requested_pr="123"):
         temp = tempfile.TemporaryDirectory()
         self.addCleanup(temp.cleanup)

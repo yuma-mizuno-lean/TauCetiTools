@@ -3,6 +3,7 @@
 import copy
 import io
 import json
+import os
 import re
 import subprocess
 import tempfile
@@ -12,13 +13,60 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
-from tauceti_tools.project import ConfigError
+from tauceti_tools.project import ConfigError, load
+from tauceti_tools.scaffold import initial_configuration
+from tauceti_tools.templates import ASSETS, render
 from tauceti_tools.upstreams import guard, release, toolchain_for, update
 
 PIN = "leanprover/lean4:v4.36.0-rc1"
 
 
 class UpstreamTests(unittest.TestCase):
+    def test_rendered_bump_guard_routes_downstream_and_preserves_canonical_policy(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            config = root / "tauceti.toml"
+            config.write_text(initial_configuration("yuma-mizuno-lean/Mei", "human"))
+            script = root / "check-bump.sh"
+            script.write_text(render((ASSETS / "scripts/check-bump.sh").read_text(), load(str(config))))
+            base, candidate = root / "base", root / "candidate"
+            for checkout in (base, candidate):
+                checkout.mkdir()
+                (checkout / "lakefile.toml").write_text('name = "Mei"\n')
+                (checkout / "lean-toolchain").write_text(PIN + "\n")
+                (checkout / "lake-manifest.json").write_text('{"packages": []}\n')
+            # Only formatting changes: enough to exercise dispatch before validation.
+            (candidate / "lake-manifest.json").write_text('{"packages": []}\n\n')
+            stub = root / "python3"
+            stub.write_text('#!/bin/sh\nprintf "%s\\n" "$@"\nexit 73\n')
+            stub.chmod(0o755)
+            env = dict(os.environ, PATH=str(root) + os.pathsep + os.environ["PATH"],
+                       TAUCETI_REPO="yuma-mizuno-lean/Mei", TAUCETI_CONF_SNAPSHOT=str(config))
+
+            def run(**overrides):
+                return subprocess.run(["bash", str(script), str(base), str(base), str(candidate)],
+                                      env=dict(env, **overrides), capture_output=True, text=True)
+
+            result = run()
+            self.assertEqual(result.returncode, 73, result.stdout + result.stderr)
+            self.assertEqual(result.stdout.splitlines(), ["-m", "tauceti_tools", "upstreams", "guard",
+                             "--conf", str(config), "--base", str(base), "--merge-base", str(base),
+                             "--checkout", str(candidate)])
+            for overrides in ({"TAUCETI_REPO": "TauCetiProject/TauCeti"},
+                              {"TAUCETI_REPO": ""}, {"TAUCETI_CONF_SNAPSHOT": ""}):
+                result = run(**overrides)
+                self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+                self.assertNotIn("upstreams", result.stdout)
+            (candidate / "lake-manifest.json").write_bytes((base / "lake-manifest.json").read_bytes())
+            result = run()
+            self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
+            self.assertIn("no lakefile or Lake-pin change", result.stdout)
+            (candidate / "lakefile.toml").write_text('name = "ChangedPolicy"\n')
+            result = run()
+            self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+            self.assertIn("human-owned", result.stdout)
+            self.assertNotIn("upstreams", result.stdout)
+
     def test_guard_reproduces_pins_from_base_and_rejects_tampering(self):
         direct = {"name": "cslib", "url": "https://github.com/leanprover/cslib", "type": "git",
                   "rev": "a" * 40, "inputRev": "main", "inherited": False}

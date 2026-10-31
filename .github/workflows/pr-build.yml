@@ -28,6 +28,7 @@ on:
       tools_ref: {type: string, required: true}
       project_ref: {type: string, required: true}
       lean_root: {type: string, required: true}
+      lake_cache_bundle: {type: boolean, default: false}
       roadmap_dir: {type: string, required: true}
     secrets:
       APP_ID: {required: false}
@@ -276,6 +277,15 @@ jobs:
       # dependents. The cache step below limits how many ancestors it reads. The checkout is the
       # immutable raw event head. Scope/config/bump authorization runs on it before
       # preparing the prospective integration below.
+      - name: Reclaim unused hosted-runner SDK storage before Lean caches
+        if: ${{ env.INFRA != '1' && runner.environment == 'github-hosted' && runner.os == 'Linux' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.tauceti-tools
+          TAUCETI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        # Trusted, workflow-pinned implementation; no PR code or arbitrary targets.
+        # Keep head resolution first so the always-run reporter can name failures.
+        run: python3 -m tauceti_tools.ci_runner_storage
+
       - name: Checkout the exact candidate head (untrusted contents, no credentials)
         if: ${{ env.INFRA != '1' }}
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
@@ -285,6 +295,7 @@ jobs:
           path: pr
           persist-credentials: false
           fetch-depth: 0
+          allow-unsafe-pr-checkout: true
 
       - name: Scope guard — allow ${{ inputs.lean_root }} sources and validated pins
         env:
@@ -1010,8 +1021,20 @@ jobs:
       # pr/.lake writable) can read what the network `lake cache get` step populates. We
       # never pass the cache *endpoints* into the sandbox, so the build stays offline and
       # can only consult the locally-populated cache.
+      - name: Restore root cache in one GitHub bundle
+        if: ${{ env.INFRA != '1' && inputs.lake_cache_bundle }}
+        uses: ./.tauceti-tools/.github/actions/restore-lake-bundle
+        with:
+          project-dir: pr
+          package: ${{ inputs.lean_root }}
+          script: gate/scripts/lake_cache_bundle.py
+
+      - name: Fetch configured upstream caches (root uses offline bundle)
+        if: ${{ env.INFRA != '1' && inputs.lake_cache_bundle }}
+        run: python3 gate/scripts/lake_dependency_cache.py pr
+
       - name: Configure the Lake artifact cache (no-op unless the public endpoints are set)
-        if: ${{ env.INFRA != '1' }}
+        if: ${{ env.INFRA != '1' && !inputs.lake_cache_bundle }}
         env:
           PUBLIC_ARTIFACT_ENDPOINT: ${{ vars.LAKE_CACHE_ARTIFACT_ENDPOINT_PUBLIC }}
           PUBLIC_REVISION_ENDPOINT: ${{ vars.LAKE_CACHE_REVISION_ENDPOINT_PUBLIC }}
@@ -1042,7 +1065,7 @@ jobs:
       # downloads. If all attempts remain incomplete, it discards the partial cache and falls
       # back to no cache so ci.yml's post-merge build has the same final semantics.
       - name: Fetch ${{ inputs.lean_root }}'s own oleans from the Lake cache (network, no token; no PR code)
-        if: ${{ env.INFRA != '1' && env.TAUCETI_CACHE_ENABLED == '1' }}
+        if: ${{ env.INFRA != '1' && env.TAUCETI_CACHE_ENABLED == '1' && !inputs.lake_cache_bundle }}
         env:
           # Passed under non-LAKE_ names so Lake never sees the deprecated endpoint
           # environment variables; the script hands it the endpoints through a `--service` config.

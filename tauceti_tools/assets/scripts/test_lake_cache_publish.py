@@ -18,11 +18,13 @@ from unittest.mock import patch
 
 import lake_cache_publish as publish
 import lake_cache_reuse as reuse
+from tauceti_tools.templates import ASSETS
 
 INTEGRATION = "--integration" in sys.argv
 if INTEGRATION:
     sys.argv.remove("--integration")
 ROOT = Path(__file__).resolve().parents[1]
+WORKFLOWS = ASSETS.parent.parent / ".github/workflows"
 TOOLCHAIN = (ROOT / "lean-toolchain").read_text().strip()
 SHA = "a" * 40
 NAME = "0123456789abcdef.ltar"
@@ -282,23 +284,24 @@ class PublicationTests(unittest.TestCase):
         self.assertIn("must never receive upload credentials", result.stderr)
 
     def test_workflow_boundaries_and_producer_eligibility(self):
-        workflow = (ROOT / ".github/workflows/pr-build.yml").read_text()
+        workflow = (WORKFLOWS / "pr-build.yml").read_text()
         stage = workflow.split("- name: Prepare merge-group cache artifact metadata", 1)[1].split("- name:", 1)[0]
         self.assertIn("env.IS_BATCH == 'true'", stage)
         self.assertIn("steps.build.outcome == 'success'", stage)
         self.assertIn("python3 gate/scripts/lake_cache_publish.py stage", stage)
-        self.assertIn("ref: ${{ github.workflow_sha }}", workflow)
-        publisher = (ROOT / ".github/workflows/publish-lake-cache.yml").read_text()
+        self.assertIn("ref: ${{ inputs.project_ref }}", workflow)
+        self.assertIn("ref: ${{ inputs.tools_ref }}", workflow)
+        publisher = (WORKFLOWS / "publish-lake-cache.yml").read_text()
         planner = publisher.split("- name: Validate staged data", 1)[1].split("- name:", 1)[0]
         upload = publisher.split("- name: Publish the staged Lake cache", 1)[1].split("- name:", 1)[0]
         self.assertNotIn("LAKE_CACHE_KEY", planner)
-        self.assertIn("publisher-tools/scripts/lake_cache_publish.py prepare", planner)
+        self.assertIn("publisher-tools/tauceti_tools/assets/scripts/lake_cache_publish.py prepare", planner)
         self.assertNotIn("python", upload)
         self.assertNotIn("lake cache", upload)
         self.assertLess(upload.index('"$PLAN/artifacts.curl"'), upload.index('"$PLAN/outputs.jsonl"'))
         self.assertIn("--fail-early", upload)
         tools = publisher.split("- name: Check out workflow-pinned publication planning tools", 1)[1].split("- name:", 1)[0]
-        self.assertIn("ref: ${{ github.workflow_sha }}", tools)
+        self.assertIn("ref: ${{ inputs.tools_ref }}", tools)
 
 
 @unittest.skipUnless(INTEGRATION, "pass --integration with stock Lake installed")
@@ -399,7 +402,7 @@ class StockLakePublication(unittest.TestCase):
             staging, plan, stats = cycle(1)
             self.assertEqual(stats["inherited"], len(unchanged))
             # Run the exact workflow upload shell, with dummy credentials to the TLS fixture.
-            workflow = (ROOT / ".github/workflows/publish-lake-cache.yml").read_text()
+            workflow = (WORKFLOWS / "publish-lake-cache.yml").read_text()
             block = workflow.split("- name: Publish the staged Lake cache", 1)[1].split("- name:", 1)[0]
             shell = block.split("        run: |\n", 1)[1]
             lines = []
