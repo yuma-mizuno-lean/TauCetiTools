@@ -117,8 +117,11 @@ its compute and migrations untouched.
 Credentials are held in operator secrets and server/CI secret stores, never in
 this repository or client configuration. CI receives only the two isolated test
 URLs as `STATE_TEST_POSTGRES_URL` and `STATE_TEST_POSTGRES_MIGRATION_URL`; it has
-no Neon API key or production credential. The PostgreSQL CI job runs for trusted
-repository branches. Fork pull requests still run the SQLite suite.
+no Neon API key or production credential. The live-provider PostgreSQL CI job
+runs for trusted branches in `TauCetiProject/TauCetiTools`, which owns that test
+environment. Fork repositories and external pull requests run the package and
+SQLite/contract suites without requiring their own Neon credentials. A skipped
+live-provider job does not establish PostgreSQL deployment validation.
 
 ## Explicit test setup
 
