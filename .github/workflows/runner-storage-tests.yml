@@ -1,0 +1,33 @@
+name: Hosted runner storage tests
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/pr-build.yml
+      - .github/workflows/runner-storage-tests.yml
+      - tauceti_tools/ci_runner_storage.py
+      - tests/test_ci_runner_storage.py
+  push:
+    paths:
+      - .github/workflows/pr-build.yml
+      - .github/workflows/runner-storage-tests.yml
+      - tauceti_tools/ci_runner_storage.py
+      - tests/test_ci_runner_storage.py
+
+permissions:
+  contents: read
+
+jobs:
+  storage:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      - name: Test fixed paths and self-hosted/workspace protection
+        run: python3 -m unittest discover -s tests -p test_ci_runner_storage.py -v
+      - name: Measure actual hosted image reclamation
+        env:
+          TAUCETI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        run: python3 -m tauceti_tools.ci_runner_storage

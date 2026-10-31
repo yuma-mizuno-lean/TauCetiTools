@@ -277,6 +277,15 @@ jobs:
       # dependents. The cache step below limits how many ancestors it reads. The checkout is the
       # immutable raw event head. Scope/config/bump authorization runs on it before
       # preparing the prospective integration below.
+      - name: Reclaim unused hosted-runner SDK storage before Lean caches
+        if: ${{ env.INFRA != '1' && runner.environment == 'github-hosted' && runner.os == 'Linux' }}
+        env:
+          PYTHONPATH: ${{ github.workspace }}/.tauceti-tools
+          TAUCETI_RUNNER_ENVIRONMENT: ${{ runner.environment }}
+        # Trusted, workflow-pinned implementation; no PR code or arbitrary targets.
+        # Keep head resolution first so the always-run reporter can name failures.
+        run: python3 -m tauceti_tools.ci_runner_storage
+
       - name: Checkout the exact candidate head (untrusted contents, no credentials)
         if: ${{ env.INFRA != '1' }}
         uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
