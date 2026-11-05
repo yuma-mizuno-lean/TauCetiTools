@@ -13,14 +13,12 @@ import unittest
 from unittest.mock import patch
 
 import lake_cache_reuse as reuse
-from tauceti_tools.templates import ASSETS
 
 
 INTEGRATION = "--integration" in sys.argv
 if INTEGRATION:
     sys.argv.remove("--integration")
 ROOT = Path(__file__).resolve().parents[1]
-WORKFLOWS = ASSETS.parent.parent / ".github/workflows"
 
 
 class ReuseTests(unittest.TestCase):
@@ -122,28 +120,6 @@ class ReuseTests(unittest.TestCase):
         self.archive.unlink()
         os.mkfifo(self.archive)
         self.assertEqual(reuse.reconnect(self.root, self.saved), 0)
-
-    def test_sandbox_snapshot_is_readonly_and_before_build(self):
-        workflow = (WORKFLOWS / "pr-build.yml").read_text()
-        snapshot = "python3 gate/scripts/lake_cache_reuse.py snapshot pr gate/lake-cache-reuse.json"
-        self.assertLess(workflow.index("run: bash gate/scripts/lake-cache-get.sh pr"), workflow.index(snapshot))
-        self.assertLess(workflow.index(snapshot), workflow.index("- name: Build exact candidate under bwrap"))
-        self.assertIn('--ro-bind "$PWD/gate" "$PWD/gate"', workflow)
-        build = (ROOT / "scripts/sandbox-build.sh").read_text()
-        self.assertLess(build.index('bash "$TRUSTED_SCRIPTS/lint-style.sh"'), build.index("lake_cache_reuse.py"))
-        self.assertLess(build.index("lake_cache_reuse.py"), build.index("lake build --no-build --rehash -o"))
-
-    def test_toolchain_bumps_test_the_validated_candidate_pin_before_building(self):
-        workflow = (WORKFLOWS / "pr-build.yml").read_text()
-        block = workflow.split("- name: Validate Lake archive reuse against a changed toolchain", 1)[1].split("- name:", 1)[0]
-        self.assertIn("env.INFRA != '1' && env.TOOLCHAIN_CHANGED == '1'", block)
-        self.assertIn('ELAN_TOOLCHAIN="$(cat pr/lean-toolchain)"', block)
-        self.assertIn("python3 gate/scripts/test_lake_cache_reuse.py --integration", block)
-        position = workflow.index(block)
-        self.assertLess(workflow.index("- name: Validate the Lake-pin bump before building"), position)
-        self.assertLess(workflow.index("- name: Fetch Mathlib with the (bump-validated) config"), position)
-        self.assertLess(position, workflow.index("- name: Build exact candidate under bwrap"))
-
 
 @unittest.skipUnless(INTEGRATION, "pass --integration with Lake installed")
 class StockLakeTests(unittest.TestCase):

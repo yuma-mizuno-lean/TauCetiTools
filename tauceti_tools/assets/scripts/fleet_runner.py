@@ -40,8 +40,8 @@ def inventory(pages):
 def ranked_runners(pages, *, kind, machines, reserved=()):
     """Extend the existing picker with ordered, class-safe machine candidates.
 
-    Each machine has one shared ceiling across PR and staging work. Queued jobs
-    already targeting an instance count against that machine's observed capacity.
+    Hosts advertise capacity through registered runners and their class labels.
+    Busy runners and instances already targeted by queued jobs are unavailable.
     """
     if kind not in ("pr", "staging"):
         raise ValueError("unknown CI job class")
@@ -52,32 +52,21 @@ def ranked_runners(pages, *, kind, machines, reserved=()):
     reserved = set(reserved)
     result, seen = [], set()
     for machine in machines:
-        identity, maximum = machine["machine_id"], machine["max_jobs"]
+        identity = machine["machine_id"]
         if not re.fullmatch(r"[a-f0-9]{32}", identity) or identity in seen:
             raise ValueError("invalid or duplicate machine identity")
         seen.add(identity)
-        if type(maximum) is not int or not 1 <= maximum <= 16:
-            raise ValueError("invalid shared machine limit")
-        if not isinstance(machine["kinds"], list) or not machine["kinds"] or any(k not in ("pr", "staging") for k in machine["kinds"]):
-            raise ValueError("invalid machine job classes")
-        if kind not in machine["kinds"]:
-            continue
-        matching = []
+        ready = []
         for runner in found:
             labels = {str(label.get("name", "")).lower() for label in runner.get("labels", [])}
-            if "fleet-" + identity in labels:
-                matching.append((runner, labels))
-        occupied = {r["id"] for r, _ in matching if r.get("busy") is not False or r["id"] in reserved}
-        room = max(0, maximum - len(occupied))
-        ready = []
-        for runner, labels in matching:
             instances = [label for label in labels if re.fullmatch(r"fleet-instance-[a-f0-9]{16}", label)]
             required = {"self-hosted", "linux", "x64", "fleet-" + identity, "tauceti-fleet-" + kind}
             if (runner.get("status") == "online" and runner.get("busy") is False
                     and runner["id"] not in reserved and required <= labels and len(instances) == 1):
                 ready.append(dict(machine=machine["name"], machine_id=identity, runner_id=runner["id"],
+                                  staging_only=kind == "staging" and "tauceti-fleet-pr" not in labels,
                                   labels=sorted(required | {instances[0]})))
-        result.extend(sorted(ready, key=lambda r: r["runner_id"])[:room])
+        result.extend(sorted(ready, key=lambda r: (not r["staging_only"], r["runner_id"])))
     return result
 
 
@@ -151,12 +140,12 @@ class APIPage:
         self.body, self.next_page = body, next_page
 
 
-def shared_capacity(repository, token):
+def shared_capacity(repository, token, namespace_cap=20):
     """Read the existing shared discovery endpoint, accepting only fresh coverage."""
     if not token:
         return None
     request = urllib.request.Request(
-        "https://github-state.taucetiproject.org/v1/runner-capacity?" + urllib.parse.urlencode(dict(repository=repository)),
+        "https://github-state.taucetiproject.org/v1/runner-capacity?" + urllib.parse.urlencode(dict(repository=repository, namespace_cap=namespace_cap)),
         headers={"Authorization": "Bearer " + token, "User-Agent": "TauCetiFleetPicker/2.0"})
     # Cold shared scans have a 15-second discovery deadline and drain their
     # in-flight requests. Let that single scan finish before direct fallback.
@@ -175,14 +164,23 @@ def shared_capacity(repository, token):
             or not numeric(value.get("observed_at")) or not -5000 <= now - value["observed_at"] <= 150000
             or not numeric(value.get("retry_at")) or value["retry_at"] <= now):
         raise ObservationError("incomplete or stale shared capacity")
-    result = dict(github_busy=value["busy"], namespace_busy=None, queued_fleet=None)
-    if value.get("routing_version") == 2:
-        queued = value.get("queued_fleet")
-        if (type(value.get("namespace_busy")) is not int or not 0 <= value["namespace_busy"] <= 10000
-                or not isinstance(queued, list) or len(queued) > 10000
+    reason = value.get("placement_unavailable")
+    if reason is not None and (not isinstance(reason, str) or not re.fullmatch(r"capacity_[a-z_]{1,64}", reason)):
+        reason = None
+    result = dict(github_busy=value["busy"], namespace_busy=None, queued_fleet=None, placement_unavailable=reason)
+    lower = value.get("namespace_busy_lower_bound")
+    if type(lower) is int and 0 <= lower <= 10000:
+        result["namespace_busy_lower_bound"] = lower
+    queued = value.get("queued_fleet")
+    if queued is not None:
+        if (not isinstance(queued, list) or len(queued) > 10000
                 or any(not isinstance(labels, list) or len(labels) > 100 or any(not isinstance(v, str) for v in labels) for labels in queued)):
+            raise ObservationError("invalid shared fleet reservations")
+        result["queued_fleet"] = [set(labels) for labels in queued]
+    if value.get("routing_version") == 2:
+        if type(value.get("namespace_busy")) is not int or not 0 <= value["namespace_busy"] <= 10000 or queued is None:
             raise ObservationError("invalid shared placement capacity")
-        result.update(namespace_busy=value["namespace_busy"], queued_fleet=[set(labels) for labels in queued])
+        result["namespace_busy"] = value["namespace_busy"]
     return result
 
 
@@ -310,7 +308,8 @@ def route(*, kind, order, machines, runner_pages, observed, github_budget, names
     """Choose in the configured preference order using one bounded observation.
 
     Limits are approximate: simultaneous pickers can observe the same spare slot.
-    When all pools are full or unknown, wait for a free GitHub-hosted slot.
+    Only a complete Namespace count below its cap establishes spare capacity.
+    Partial counts retain evidence of saturation; unknown capacity is skipped.
     """
     if type(github_budget) is not int or github_budget < 1 or type(namespace_cap) is not int or namespace_cap < 1:
         raise ObservationError("invalid capacity budgets")
@@ -325,15 +324,22 @@ def route(*, kind, order, machines, runner_pages, observed, github_budget, names
     except (ValueError, KeyError, TypeError):
         print("::warning::Fleet configuration or inventory invalid; retaining cloud choices")
         resolved, ranked = {}, []
+    namespace_busy = observed.get("namespace_busy")
     for name in order:
         if name in excluded or name in resolved and resolved[name]["machine_id"] in excluded:
             continue
         if name == "github" and observed.get("github_busy") is not None and observed["github_busy"] <= github_budget:
             return dict(pool="github")
-        if name == "namespace" and observed.get("namespace_busy") is not None and observed["namespace_busy"] < namespace_cap:
+        if name == "namespace" and namespace_busy is not None and namespace_busy < namespace_cap:
             return dict(pool="namespace")
         candidates = [r for r in ranked if r["machine"] == name]
         if candidates:
+            # Spread concurrent jobs within the preferred tier. Hashing across
+            # every eligible guest could strand a reserved staging slot while
+            # consuming the host's general-purpose PR capacity.
+            staging_only = [r for r in candidates if r["staging_only"]]
+            if staging_only:
+                candidates = staging_only
             offset = int(hashlib.sha256(selection_key.encode()).hexdigest(), 16) if selection_key else 0
             return dict(candidates[offset % len(candidates)], pool=name)
     return dict(pool="github", waiting=True)
@@ -390,9 +396,9 @@ def route_main():
     if fallback and fallback != token:
         readers.append((fallback, int(environment.get("REPOSITORY_API_RESERVE") or "250")))
     try:
-        observed = shared_capacity(repository, environment.get("GITHUB_STATE_TOKEN", "")) or observed
+        observed = shared_capacity(repository, environment.get("GITHUB_STATE_TOKEN", ""), namespace_cap) or observed
     except (OSError, ValueError, KeyError, TypeError):
-        print("::notice::Shared capacity unavailable; retaining bounded direct discovery")
+        print("::warning::Shared capacity unavailable; retaining native runner fallback")
     order = config.get("staging_order" if kind == "staging" else "pr_order", ["github", "namespace"])
     excluded = set()
     attempt = int(environment["GITHUB_RUN_ATTEMPT"])
@@ -434,7 +440,9 @@ def route_main():
                       selection_key=environment["GITHUB_RUN_ID"])
     selected = None if candidate.get("waiting") else candidate
     scanned = False
-    if selected is None and needs_cloud_capacity:
+    # A configured shared service owns the bounded organization scan. A partial
+    # result or outage must not fan out into another scan from every queued picker.
+    if selected is None and needs_cloud_capacity and not environment.get("GITHUB_STATE_TOKEN"):
         for credential, reserve in readers:
             try:
                 reader = GitHubRead(credential, reserve)
@@ -462,12 +470,26 @@ def route_main():
     values = dict(runner=json.dumps(target, separators=(",", ":")), pool=selected["pool"],
                   fleet=str(selected["pool"] not in ("github", "namespace")).lower(),
                   github=str(selected["pool"] == "github").lower(), busy=observed["github_busy"],
-                  namespace_busy=observed["namespace_busy"], budget=budget, namespace_cap=namespace_cap,
+                  namespace_busy=observed["namespace_busy"], namespace_busy_lower_bound=observed.get("namespace_busy_lower_bound"),
+                  placement_unavailable=observed.get("placement_unavailable"), budget=budget, namespace_cap=namespace_cap,
                   attempt=environment["GITHUB_RUN_ATTEMPT"])
     with open(environment["GITHUB_OUTPUT"], "a") as out:
         out.write("".join(f"{k}={v if v is not None else ''}\n" for k, v in values.items()))
+    lower = observed.get("namespace_busy_lower_bound")
+    if observed["namespace_busy"] is not None:
+        namespace_count = str(observed["namespace_busy"])
+        namespace_inventory = "complete"
+        namespace_state = "cap reached" if observed["namespace_busy"] >= namespace_cap else "capacity available"
+    else:
+        namespace_count = f">={lower}" if lower is not None else "unknown"
+        namespace_inventory = "partial" if lower is not None else "unavailable"
+        namespace_state = "cap reached" if lower is not None and lower >= namespace_cap else "capacity unknown"
     message = (f"CI class={kind}; pool={selected['pool']}; GitHub busy={observed['github_busy']}/{budget}; "
-               f"Namespace builds queued/running={observed['namespace_busy']}/{namespace_cap} (approximate cap).")
+               f"Namespace builds queued/running={namespace_count}/{namespace_cap}; "
+               f"inventory={namespace_inventory}; {namespace_state}")
+    if observed.get("placement_unavailable"):
+        message += f"; reason={observed['placement_unavailable']}"
+    message += " (approximate cap)."
     print(message)
     if environment.get("GITHUB_STEP_SUMMARY"):
         with open(environment["GITHUB_STEP_SUMMARY"], "a") as out:

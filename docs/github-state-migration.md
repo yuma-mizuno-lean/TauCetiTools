@@ -7,32 +7,101 @@ is stored-read compatibility and durable parked ingress. S1
 Neon PostgreSQL backend. Both must be deployed and accepted before production
 start. Merging code or closing an issue does not prove deployed acceptance.
 
+The [2026-10-26 production release](../services/github-state/validation/migration-production-release-2026-10-26.json)
+records the completed production migration after fresh deployed S0/S1 acceptance.
+All twenty tables, 8,035,458 rows and 3,972 SQL pages passed canonical
+source/import/PostgreSQL readback checks before execution normalization and
+activation. The R2 inventory verified 1,721,084 objects. PostgreSQL became the
+sole writer at 00:03:41 UTC; ordinary bounded replay completed at 06:15:57 UTC.
+The final parked/held and queue/DLQ snapshots were zero. The original Durable
+Object remains fenced, archives remain retained, and all seven broad retention
+classes remain pinned with lifecycle expiry disabled. No observation finish,
+unpinning, retirement or write flipback was performed.
+
+Exactly one production target cohort passed: warm open-PR, survey and comment
+p95 were 280, 133 and 105 ms, versus the frozen source's 251, 145 and 109 ms.
+Each workload used 100 samples, concurrency four and five warmups; the largest
+increase was 11.6%, within the 20% gate. Both cohorts used the same deployed
+module with different live data revisions and include the existing DTO cache.
+Separate cycled cache-miss diagnostics include a history p95 increase from
+90 to 443 ms; those diagnostics have no 20% acceptance claim. The unchanged
+original Worker client passed fresh-cache and byte-exact copied retained-cache
+workflows, including marker-list repair and 304 revalidation, without independent
+provider attempts. Old public cursors expired normally, new continuations passed,
+and pre-selection stored shadow checks covered active cursors and activity.
+
+A real pull-request webhook arrived 19.360 seconds after the authoritative
+freeze. Its retained raw body, original timestamp and pin were verified beyond
+the configured twenty-retry horizon; it was absent from the verified standby
+delivery table before activation. Observations after replay verified one SQL
+delivery receipt, the permanent R2 receipt and exact retained raw body/timestamp;
+pointer/pin absence was observed after the SQL commit. This is delivery/cleanup
+evidence, not an independent replay of
+every materialization or audit of every semantic publication. A full logged-request
+hour wholly after replay completion contained 423 repository requests. Across 327
+discrete post-completion samples, observed in-flight requests never exceeded the
+configured owner concurrency of four. Retained accounting
+does not prove every external attempt was logged. The receipt preserves failed
+operational probes, automatic rate-limit recovery, and a final publication attempt
+that stopped on newly arriving input before safely resuming with the original
+passed cohort and full-hour evidence. Private evidence hashes are commitments to
+retained operator files, not files published in this repository.
+
+The [2026-10-25 test release](../services/github-state/validation/migration-test-release-2026-10-25.json)
+records accepted TEST migration: twenty tables, 17,921,250 rows, canonical
+source/import/readback checks, a completed retained raw-input pass with zero
+reported gaps, all 221 captured failed
+inputs and the signed freeze-time webhook verified, unchanged clients and cursors,
+and a complete request-accounting hour after replay finished. PostgreSQL is the
+single TEST writer; the original Durable Object, archives and all seven retention
+pins remain retained. At that historical receipt, production still used SQLite and
+its data migration had not started. The production release above records its
+subsequent independent deployed acceptance and cutover.
+
+Exactly one target warm-read cohort was compared with the original frozen source
+cohort: open-PR, survey and issue-comment p95 were 286, 119 and 115 ms, versus
+557, 145 and 147 ms. Each workload used 100 samples, concurrency four and five
+warmups. The repeated-read gate includes the existing DTO cache; separate
+cache-miss diagnostics carry no 20% acceptance claim. Source and target used
+different deployed code and live data revisions; both identities and row counts
+are explicit in the receipt. Queue counts are approximate fresh snapshots, and
+empty R2 lanes are direct observations rather than a continuous-empty claim.
+The historical raw-pass completion timestamp does not establish traversal start.
+
 The [2026-10-22 test checkpoint](../services/github-state/validation/migration-test-checkpoint-2026-10-22.json)
-records a verified import of all twenty tables and PostgreSQL selection. Replay
-and final client, cursor, latency and request-rate acceptance remain incomplete;
-the checkpoint is not a release receipt and does not authorize production cutover.
-It preserves the original source identity and baseline, records the reviewed code
-updates separately, and records a hold after external test deployments changed
-the running artifact. Stopping the external operator initially left scheduled
-recovery running under unaccepted code against authoritative PostgreSQL. The
-checkpoint records that interval and the later durable ingress pause, which
-blocks webhook application and parked replay while accepting signed input into
-R2. Raw recovery continues after this pause, including R2 cursor and CI/non-CI
-gap-marker changes; its unaccepted-code interval remains open. Interval receipts,
-cleanup and CI gap disposition require accounting before adoption or final
-release; a lower raw-gap count is not delivery proof. Test ingress resumes only
-after the accepted live version and single PostgreSQL owner are reverified.
+remains the earlier incomplete import/selection checkpoint. It records the hold
+after external test deployments changed the running artifact, including the
+interval before a durable ingress pause. The accepted release retains that
+application-interval accounting and its limitations: one intermediate deployment is not mapped to a
+Git commit, and sampled receipt/resource checks are not a full independent
+replay of every materialization or an audit of every semantic publication.
+Raw recovery continued after the 2026-10-22 22:47 UTC ingress pause. The
+already-present artifact was verified and adopted at 23:09 UTC that day; this
+changed its acceptance status, not its proven serving start or whether raw
+recovery continued. The public receipt records that bound; it does not reconstruct
+a complete mutation audit for the intervening period or prove continuous absence
+of deletion. Clearing an unmirrored CI diagnostic is not application delivery recovery.
+
+A local cursor-verifier discovery error stopped final acceptance after the
+successful latency cohort: an empty singleton lock was parsed as JSON. The
+separately verified correction admits only timestamped baseline JSON reports;
+malformed reports and duplicate same-generation baselines still fail. The
+corrected cursor check passed once. The original 108 operator files, empty locks,
+stop evidence and successful cohort were preserved, and the observer resumed
+using retained proofs without another performance measurement. The release
+embeds the cursor proof; an external hash-bound sidecar records its corrected
+verifier provenance. Any production operator plan must include this discovery
+correction before starting its observer.
 
 The [2026-10-23 client compatibility deployment](../services/github-state/validation/migration-client-compatibility-2026-10-23.json)
 records the production deployment of [PR #90](https://github.com/TauCetiProject/TauCetiTools/pull/90)
-while SQLite remains authoritative.
-The original Worker client passed fresh-cache and retained-cache survey,
-inventory, history, pagination and 304 checks. Rereading a byte-exact copy of the retained survey
-cache added the required marker-list field to all 399 rows that lacked it.
-The unchanged client performed the refresh; the original cache was left intact. This is a code-only deployment
-receipt: test replay and its final release gates remain outstanding, and no
-production data migration has started. It does not replace the completed test
-release or fresh deployed S0/S1 acceptance required before production cutover.
+while SQLite remained authoritative. The original Worker client passed fresh-cache
+and retained-cache survey, inventory, history, pagination and 304 checks.
+Rereading a byte-exact copy of the retained survey cache added the required
+marker-list field to all 399 rows that lacked it. The unchanged client performed
+the refresh; the original cache was left intact. This code-only receipt predates
+the accepted TEST release and does not constitute a production data migration or
+replace fresh deployed S0/S1 acceptance for the final production module.
 
 ## Preparation and commands
 
