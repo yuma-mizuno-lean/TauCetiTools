@@ -230,7 +230,7 @@ def diagnose(project: Project, *, extras=True, github=None) -> list[Finding]:
             continue
         status, summary = "failed", "No version selected"
         if pin.get("ref"):
-            resolved, pin_error = gh.read(f"repos/{pin['repo']}/commits/{pin['ref']}")
+            resolved, pin_error = gh.read(f"repos/{pin['repo']}/commits/{pin['ref']}", paginate=False)
             status = "unknown" if pin_error else "ready" if resolved.get("sha") == pin["ref"] else "failed"
             summary = pin_error or pin["ref"]
         default_repo = "leanprover/doc-gen4" if tool == "docgen" else (
