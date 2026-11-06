@@ -104,7 +104,8 @@ class Snapshot(unittest.TestCase):
         log = home / "installs"
         subprocess.run(["bash", "-c", command], check=True, capture_output=True, env={
             **os.environ, "HOME": str(home), "SNAPSHOT": str(self.root),
-            "PROJECT": str(home), "TOOLING": str(ROOT), "INSTALL_LOG": str(log)})
+            "PROJECT": str(home), "TOOLING": str(ROOT), "INSTALL_LOG": str(log),
+            "GITHUB_ACTION_PATH": str(ROOT / ".github/actions/restore-lean-toolchain")})
         return log.read_text() if log.exists() else ""
 
     def test_consumer_warm_path_does_not_install(self):

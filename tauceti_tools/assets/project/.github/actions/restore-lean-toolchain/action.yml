@@ -53,6 +53,6 @@ runs:
         if ! python3 "$TOOLING/scripts/toolchain_snapshot.py" verify "$PROJECT/lean-toolchain" --root "$SNAPSHOT"; then
           echo '::notice::toolchain snapshot absent/invalid; installing from leanprover/lean4'
           rm -rf -- "$SNAPSHOT"
-          elan toolchain install "$(cat "$PROJECT/lean-toolchain")"
+          python3 "$GITHUB_ACTION_PATH/install_official_lean.py" "$(cat "$PROJECT/lean-toolchain")"
         fi
         ELAN_TOOLCHAIN="$(cat "$PROJECT/lean-toolchain")" lean --version

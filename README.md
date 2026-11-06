@@ -37,6 +37,16 @@ run. Doctor separately reports missing settings, observed credential failures an
 use that has not been checked yet. A successful rerun can verify credentials even when the
 original workflow run predates the credential update.
 
+Generated projects include `warm-dependencies.yml`, a main-only producer of verified official
+Lean snapshots. GitHub Actions caches are scoped to a repository: a downstream project cannot
+restore Tau Ceti's snapshot merely because both projects use the same Lean pin. After first
+installing these workflows on main, run `gh workflow run warm-dependencies.yml --ref main`
+in the downstream repository. Later main changes to the release pin or warmer trigger it again.
+The producer runs no project compilation and receives no publication credentials. PR builds
+only restore and verify the exact-pin snapshot; they never publish it. A missing snapshot uses
+the same official elan installation, with bounded retries for transient TLS failures and a
+per-attempt timeout. Permanent installer failures are returned immediately.
+
 Configuration is selected in this order: explicit `--conf PATH_OR_HTTPS_URL`,
 `TAUCETI_CONF`, `tauceti.toml` in the current directory, then `tauceti.toml` at the
 current Git checkout's root. This works from subdirectories and Git worktrees too.
