@@ -345,8 +345,8 @@ jobs:
           # not tell that apart from a PR with no pin change at all — so it posted the required
           # bump-guard status green, asserting a validation that had not happened, to the human
           # being asked to merge exactly that kind of PR by hand.
-          # A lint repair PR starts as an empty commit on `lint-repair/...` opened by the review
-          # bot (lint-full.yml); its first build is the full lint that shows what to repair. Only
+          # A lint repair PR starts as an empty commit on `lint-repair/...` opened by a trusted
+          # automation bot (lint-full.yml); its first build is the full lint that shows what to repair. Only
           # that exact shape is exempt from routing an empty diff to a human.
           repair_pr=0
           if [ -z "$files" ] && { [ "${{ github.event_name }}" = "workflow_dispatch" ] || [ "${{ github.event.action }}" = "tauceti-bors-pr-approved" ]; }; then
@@ -361,9 +361,10 @@ jobs:
                    || [ "${{ github.event.action }}" = "tauceti-bors-pr-approved" ]; } \
               && [ "$PR_HEAD_REPO" = "${{ github.repository }}" ] \
               && [[ "$PR_HEAD_REF" == lint-repair/* ]] \
-              && [ "$PR_USER" = "tauceti-review-bot[bot]" ]; then
+              && { [ "$PR_USER" = "tauceti-review-bot[bot]" ] \
+                   || [ "$PR_USER" = "mei-automation[bot]" ]; }; then
             repair_pr=1
-            echo "empty lint repair PR from the review bot: building it for its full lint"
+            echo "empty lint repair PR from a trusted automation bot: building it for its full lint"
           fi
           if [ -z "$files" ] && [ "$repair_pr" = 0 ]; then
             echo "INFRA=1" >> "$GITHUB_ENV"; echo "::warning::no files / unable to list — cannot determine scope, routing to human"

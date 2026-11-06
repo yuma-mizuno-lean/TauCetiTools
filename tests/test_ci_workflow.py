@@ -192,5 +192,62 @@ else:
         self.assertNotIn("now=$(python3 gate/scripts/github_api.py", source)
 
 
+class LintRepairIdentityTests(unittest.TestCase):
+    def repair_flag(self, author, *, event="pull_request_target", action="opened",
+                    repository="owner/Project", branch="lint-repair/main", files=""):
+        scope = shell_for("Scope guard — allow ${{ inputs.lean_root }} sources and validated pins")
+        start = scope.index("repair_pr=0")
+        end = scope.index('if [ -z "$files" ] && [ "$repair_pr" = 0 ]; then', start)
+        values = {
+            "github.event_name": event,
+            "github.event.action": action,
+            "github.repository": "owner/Project",
+            "steps.pr.outputs.num": "886",
+        }
+        shell = re.sub(r"\$\{\{\s*(.*?)\s*\}\}", lambda m: values[m[1]], scope[start:end])
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            scripts = root / "gate/scripts"
+            scripts.mkdir(parents=True)
+            (scripts / "github_api.py").write_text(
+                'import os\nprint(os.environ["API_PR_METADATA"])\n'
+            )
+            dispatched = event == "workflow_dispatch" or action == "tauceti-bors-pr-approved"
+            result = subprocess.run(
+                ["bash", "-euo", "pipefail", "-c", shell + '\nprintf "repair_flag=%s\\n" "$repair_pr"'],
+                cwd=root, text=True, capture_output=True, check=True,
+                env={
+                    **os.environ,
+                    "files": files,
+                    "PR_HEAD_REF": "" if dispatched else branch,
+                    "PR_HEAD_REPO": "" if dispatched else repository,
+                    "PR_USER": "" if dispatched else author,
+                    "API_PR_METADATA": "\t".join([branch, repository, author]),
+                },
+            )
+        return result.stdout.splitlines()[-1] == "repair_flag=1"
+
+    def test_both_trusted_bots_work_on_payload_and_dispatched_rebuilds(self):
+        for author in ["tauceti-review-bot[bot]", "mei-automation[bot]"]:
+            for event, action in [("pull_request_target", "opened"),
+                                  ("workflow_dispatch", ""),
+                                  ("repository_dispatch", "tauceti-bors-pr-approved")]:
+                with self.subTest(author=author, event=event):
+                    self.assertTrue(self.repair_flag(author, event=event, action=action))
+
+    def test_unknown_and_similarly_named_authors_remain_blocked(self):
+        for author in ["author", "untrusted[bot]", "mei-automation",
+                       "MEI-AUTOMATION[bot]", "mei-automation[bot]-other"]:
+            with self.subTest(author=author):
+                self.assertFalse(self.repair_flag(author))
+
+    def test_fork_branch_event_and_nonempty_diff_guards_remain_required(self):
+        for author in ["tauceti-review-bot[bot]", "mei-automation[bot]"]:
+            for change in [dict(repository="fork/Project"), dict(branch="feature/main"),
+                           dict(event="merge_group"), dict(files="Project/Example.lean")]:
+                with self.subTest(author=author, change=change):
+                    self.assertFalse(self.repair_flag(author, **change))
+
+
 if __name__ == "__main__":
     unittest.main()
