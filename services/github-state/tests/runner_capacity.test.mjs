@@ -119,10 +119,10 @@ const shim={name:'capacity-fixture',setup(b){b.onResolve({filter:/^cloudflare:wo
 const bundle=await build({entryPoints:['src/installation.ts'],bundle:true,format:'esm',platform:'node',write:false,plugins:[shim]});
 const {InstallationScheduler}=await import('data:text/javascript;base64,'+Buffer.from(bundle.outputFiles[0].text).toString('base64'));
 function schedulerFixture(){
- const values=new Map();let slots=0;
+ const values=new Map(),background=[];let slots=0;
  const storage={get:async k=>values.get(k),put:async(k,v)=>values.set(k,structuredClone(v)),sql:{exec(q){return {toArray:()=>[],one:()=>({n:q.includes('COUNT(*)')?slots:0,cost:0})};}}};
- const scheduler=new InstallationScheduler({storage},{});scheduler.token=async()=> 'token';scheduler.usable=()=>5000;
- return {scheduler,values,setSlots:n=>{slots=n}};
+ const scheduler=new InstallationScheduler({storage,waitUntil(promise){background.push(promise);}},{});scheduler.token=async()=> 'token';scheduler.usable=()=>5000;
+ return {scheduler,values,storage,background,setSlots:n=>{slots=n}};
 }
 test('cached-only reads retain expired snapshots without token or provider work',async()=>{
  const {scheduler,values}=schedulerFixture();
@@ -142,42 +142,36 @@ test('cached-only reads retain expired snapshots without token or provider work'
  assert.equal(retained.observed_at,1000);
  assert.equal(values.get('runner-capacity:org').complete,false,'reporting must not change routing failure state');
 });
-test('hourly allowance and lost responses survive refresh and cannot be bypassed by another caller',async()=>{
+test('legacy hourly counters cannot disable critical discovery and failed reads still coalesce',async()=>{
  const {scheduler,values}=schedulerFixture();let calls=0;
- scheduler.http=async()=>{calls++;throw new Error('connection lost')};
  values.set('runner-capacity-attempts',Array(2400).fill(Date.now()));
- let result=await (await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
- assert.equal(result.reason,'capacity_hourly_budget');assert.equal(calls,0);
- values.delete('runner-capacity:org');values.delete('runner-capacity-attempts');
- result=await (await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
+ scheduler.http=async()=>{calls++;throw new Error('connection lost');};
+ const result=await(await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
  assert.equal(result.complete,false);assert.equal(calls,1);
- assert.equal(values.get('runner-capacity-attempts').length,1);
  await scheduler.runnerCapacity({name:'org/repo',installation:'200'});assert.equal(calls,1);
+ assert.equal(values.get('runner-capacity-attempts').length,2400);
 });
-test('continuous callers fit up to 96 requests per scan within the unchanged hourly allowance',async()=>{
+
+test('continuous callers share the normal fresh-cache cadence',async()=>{
  for(const repositories of [17,26,31]){
- const {scheduler,values}=schedulerFixture();let calls=0,clock=Date.now();const original=Date.now;
+ const {scheduler,values,background}=schedulerFixture();let calls=0,scans=0,clock=Date.now();const original=Date.now;
  Date.now=()=>clock;
  scheduler.http=async path=>{
   calls++;
-  if(path.startsWith('/orgs/'))return envelope(null,Array.from({length:repositories},(_,i)=>({name:'repo'+i,archived:false})));
+  if(path.startsWith('/orgs/')){scans++;return envelope(null,Array.from({length:repositories},(_,i)=>({name:'repo'+i,archived:false})));}
   if(path.includes('/actions/runs?'))return envelope('workflow_runs',[{id:'1'}]);
   return envelope('jobs',[hosted]);
  };
  try {
-  let scans=0;
   for(let elapsed=0;elapsed<3600000;elapsed+=5000){
-   const fresh=values.get('runner-capacity:org')?.retry_at>clock;
    const result=await (await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
    assert.equal(result.complete,true);assert.equal(result.busy,repositories);
-   assert.equal(result.cached===true,fresh);
-   assert.ok(result.retry_at>clock);assert.ok(result.retry_at-result.observed_at<150000);
-   if(!fresh)scans++;
-   assert.ok(calls<=2400);
+   assert.ok(clock-result.observed_at<150000);
+   assert.ok(result.retry_at>clock);assert.ok(result.retry_at-result.observed_at<=150000);
+   await Promise.all(background.splice(0));
    clock+=5000;
   }
   assert.equal(scans,25);assert.equal(calls,scans*(1+3*repositories));
-  assert.equal(values.get('runner-capacity-attempts').length,calls);
  }finally{Date.now=original;}
  }
 });
@@ -190,7 +184,7 @@ test('brief contention for existing request slots yields and completes instead o
   const v=await result.json();assert.equal(result.status,200);assert.equal(v.busy,1);
  }finally{clearTimeout(timer);globalThis.fetch=original;}
 });
-test('a busy organization inventory uses at most four reads at once and drains in-flight reads on failure',async()=>{
+test('a busy organization inventory uses at most three reads at once and drains in-flight reads on failure',async()=>{
  let active=0,peak=0;
  const reader=(fail=false)=>async path=>{
   active++;peak=Math.max(peak,active);
@@ -203,12 +197,12 @@ test('a busy organization inventory uses at most four reads at once and drains i
   }finally{active--;}
  };
  const value=await scanHostedCapacity('org',reader());assert.equal(value.busy,24);assert.equal(value.requests,37);
- assert.equal(peak,4);assert.equal(active,0);
+ assert.equal(peak,3);assert.equal(active,0);
  await assert.rejects(()=>scanHostedCapacity('org',reader(true)),/fixture request rejected/);
  assert.equal(active,0,'refresh must settle all started requests before releasing the single flight');
 });
 
-test('many empty queued workflows preserve running capacity within the existing request budget',async()=>{
+test('a complete cold inventory can exceed 96 requests without losing useful capacity',async()=>{
  const calls=[];
  const value=await scanHostedCapacity('org',async path=>{
   calls.push(path);
@@ -217,10 +211,9 @@ test('many empty queued workflows preserve running capacity within the existing 
   if(path.includes('status=queued'))return envelope('workflow_runs',Array.from({length:100},(_,i)=>({id:i+2})));
   return envelope('jobs',path.includes('/runs/1/jobs')?[hosted,{name:'sandboxed-build',status:'in_progress',labels:['nscloud-ubuntu-test']}]:[]);
  });
- assert.equal(value.routing_version,1);assert.equal(value.busy,1);assert.equal(value.requests,96);
- assert.equal(value.namespace_busy,undefined);assert.deepEqual(value.queued_fleet,[]);
- assert.equal(value.namespace_busy_lower_bound,1);
- assert.equal(value.placement_unavailable,'capacity_scan_limit');assert.equal(calls.length,96);
+ assert.equal(value.routing_version,2);assert.equal(value.busy,1);assert.equal(value.requests,104);
+ assert.equal(value.namespace_busy,1);assert.deepEqual(value.queued_fleet,[]);
+ assert.equal(value.placement_unavailable,undefined);assert.equal(calls.length,104);
 });
 const ns=(id,status='queued')=>({id,name:'sandboxed-build',status,labels:['nscloud-ubuntu-test']});
 test('a thousand queued workflows establish saturation from their first page, busiest repository first',async()=>{
@@ -307,7 +300,7 @@ test('missing queued placement data preserves running capacity; missing running 
 });
 
 test('mixed configured targets share the most informative organization snapshot without overlapping scans',async()=>{
- const {scheduler,values}=schedulerFixture();let calls=0,active=0,peak=0;
+ const {scheduler,values,background}=schedulerFixture();let calls=0,active=0,peak=0;
  scheduler.http=async path=>{
   calls++;active++;peak=Math.max(peak,active);
   try {
@@ -327,7 +320,7 @@ test('mixed configured targets share the most informative organization snapshot 
  assert.equal((await get(8)).cached,true);assert.equal((await get(30)).cached,true);assert.equal((await get(10000)).cached,true);assert.equal(calls,7);
  const saved=values.get('runner-capacity:org');values.set('runner-capacity:org',{...saved,retry_at:0});
  const refreshed=await get(8);assert.equal(refreshed.namespace_discovery_target,30);assert.equal(refreshed.namespace_busy,20);
- assert.equal((await get(30)).cached,true);assert.equal(calls,11,'mixed caps add no scans after the first target upgrade');
+ assert.equal((await get(30)).cached,true);await Promise.all(background.splice(0));assert.equal(calls,11,'mixed caps add no scans after the first target upgrade');
  for(const namespace_cap of [0,-1,true,1.5,10001,'20'])assert.equal((await scheduler.runnerCapacity({name:'org/repo',installation:'200',namespace_cap})).status,400);
 });
 test('endpoint validates requested caps before starting discovery',async()=>{
@@ -378,4 +371,83 @@ test('partial discovery failures share the same cooldown across different caps',
  const [one,two,three]=await Promise.all([get(8),get(30),get(30)]);
  assert.equal(one.complete,false);assert.equal(two.complete,false);assert.equal(three.complete,false);assert.equal(calls,1);
  assert.equal((await get(10000)).cached,true);assert.equal(calls,1);
+});
+
+test('valid cold capacity discovery can finish after twenty seconds within the unchanged request budget',async t=>{
+ let clock=Date.parse('2026-11-06T21:00:00Z');t.mock.method(Date,'now',()=>clock);
+ const {read,calls}=readFixture();
+ const snapshot=await scanHostedCapacity('org',async(path,body)=>{clock+=5000;return read(path,body);});
+ assert.equal(snapshot.routing_version,2);
+ assert.ok(snapshot.elapsed_ms>20000);
+ assert.ok(snapshot.observed_at<Date.now(),'queued discovery cannot refresh the age of the running observation');
+ assert.equal(snapshot.requests,calls.length);
+ assert.ok(snapshot.requests<=96);
+ assert.equal(snapshot.namespace_busy,2);
+});
+
+test('a shared scan retains its lifetime and publishes for later callers without a waiting HTTP client',async()=>{
+ const {scheduler,values,background}=schedulerFixture();
+ const {read}=readFixture();let release;
+ const held=new Promise(resolve=>{release=resolve;});
+ scheduler.http=async(path,token,method,body)=>{await held;return read(path,body);};
+ const abandoned=scheduler.runnerCapacity({name:'org/repo',installation:'200'});
+ for(let i=0;i<20 && background.length===0;i++)await new Promise(resolve=>setImmediate(resolve));
+ assert.equal(background.length,1,'the owner retains the scan independently of the HTTP response');
+ release();await Promise.all(background);
+ const saved=values.get('runner-capacity:org');assert.equal(saved.routing_version,2);
+ assert.equal(saved.namespace_busy,2);
+ assert.equal((await(await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json()).cached,true);
+ await abandoned;
+});
+
+test('large passes complete despite legacy hourly counters and stale artificial cooldowns',async()=>{
+ const {scheduler,values}=schedulerFixture();let calls=0;
+ values.set('runner-capacity-attempts',Array(2400).fill(Date.now()));
+ values.set('runner-capacity:org',{complete:true,organization:'org',namespace_discovery_target:20,routing_version:1,placement_unavailable:'capacity_metadata_reserve',observed_at:Date.now(),retry_at:Date.now()+3600000});
+ scheduler.http=async path=>{
+  calls++;
+  if(path.startsWith('/orgs/'))return envelope(null,Array.from({length:40},(_,i)=>({name:'repo'+i,archived:false})));
+  if(path.includes('/actions/runs?'))return envelope('workflow_runs',[{id:1}]);
+  return envelope('jobs',[hosted]);
+ };
+ const result=await(await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
+ assert.equal(result.routing_version,2);assert.equal(result.busy,40);assert.ok(calls>96);
+ assert.ok(result.retry_at-result.observed_at<=145001);assert.equal(values.get('runner-capacity-attempts').length,2400);
+ const count=calls;assert.equal((await(await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json()).cached,true);assert.equal(calls,count);
+});
+
+test('a valid slow scan can acquire a temporarily occupied slot after its first twenty seconds',async t=>{
+ const {scheduler,setSlots}=schedulerFixture(),{read}=readFixture();let clock=Date.now(),first=true,timer;
+ t.mock.method(Date,'now',()=>clock);const original=globalThis.fetch;
+ globalThis.fetch=async url=>{
+  if(first){first=false;clock+=21000;setSlots(4);timer=setTimeout(()=>{clock+=300;setSlots(0);},100);}
+  const u=new URL(url),value=await read(u.pathname+u.search);return Response.json(value.body);
+ };
+ try{
+  const result=await(await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
+  assert.equal(result.complete,true);assert.equal(result.routing_version,2);assert.equal(result.busy,1);
+ }finally{clearTimeout(timer);globalThis.fetch=original;}
+});
+
+test('queued discovery time does not push refresh beyond the client freshness window',async t=>{
+ const {scheduler}=schedulerFixture(),{read}=readFixture();let clock=Date.now();
+ t.mock.method(Date,'now',()=>clock);
+ scheduler.http=async(path,token,method,body)=>{clock+=5000;return read(path,body);};
+ const result=await(await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
+ assert.equal(result.routing_version,2);assert.ok(result.observed_at<clock);
+ assert.equal(result.retry_at-result.observed_at,145000);
+ assert.ok(result.retry_at<result.observed_at+150000);
+});
+
+
+test('repository names beginning with jobs do not turn run listings into job-detail reads',async()=>{
+ const value=await scanHostedCapacity('org',async path=>path.startsWith('/orgs/')?envelope(null,[{name:'jobs-queue',archived:false}]):envelope('workflow_runs',[]));
+ assert.equal(value.request_types.run_listings,2);assert.equal(value.request_types.job_details,undefined);
+});
+
+test('real provider reserves still stop discovery when provider quota is unavailable',async()=>{
+ const {scheduler}=schedulerFixture();let calls=0;scheduler.usable=()=>1499;
+ scheduler.http=async()=>{calls++;throw Error('must not launch');};
+ const result=await(await scheduler.runnerCapacity({name:'org/repo',installation:'200'})).json();
+ assert.equal(result.complete,false);assert.equal(result.reason,'capacity_quota_reserve');assert.equal(calls,0);
 });

@@ -582,7 +582,7 @@ identity. Missing or paginated check-suite data uses ordinary REST discovery.
 Completed REST job receipts cannot be resurrected by a delayed check-suite status.
 Inactive metadata entries expire after an hour; cached metadata is never an
 activity count. Parallel GraphQL batches request at most 100 suites and 200 job
-nodes each to bound latency and point cost under the same four-request gate.
+nodes each to bound latency and point cost under the same three-request gate.
 
 Large queued listings use overlapping creation-time ranges instead of shifting
 offset pages. Their split instant belongs to both children, avoiding sub-second
@@ -596,26 +596,25 @@ and subdivides any newly overfull range. No coverage or activity is cached.
 Fresh leaf counts merge sparse neighboring ranges and remove all splits when a
 queue drains, so old bursts do not permanently multiply listing requests.
 
-Each pass has a ninety-six-request ceiling, counting REST and GraphQL
-calls, with a twenty-second launch window inside the picker's existing 25-second
-timeout. Cached-only status reads never wait for that discovery. A productive partial pass has one shared thirty-second
-cooldown only while its cache-hit frontier advances and fewer than 900 attempts
-have been spent in the rolling hour. Active pickers continue unseen work after an
-owner restart; no extra poller is added. Normal successful scans and other failures
-keep the 145-second cache. The 2400-attempt hourly ceiling and 1500 core reserve
-are unchanged; GraphQL observation also preserves a 1000-point reserve.
-At most twenty-five full scans fit in a rolling hour; 25 × 96 stays within the
-same 2400-attempt ceiling while leaving enough room to finish each inventory.
-Initial cache bootstrap may use up to 800 attempts of that same hourly allowance
-when prior scans have already spent more than 900 calls. It never raises the
-2400-call ceiling, preserves 192 attempts before admitting a continuation, and
-closes durably on the first full inventory or after the bootstrap allowance.
+Discovery has no separate per-pass or rolling-hour request allowance. It uses
+actual shared installation quota accounting, the provider's secondary cooldowns,
+and the existing core/GraphQL reserves. Old cached allowance failures are ignored
+on upgrade without discarding immutable job labels or search boundaries.
+Normal refreshes target 145 seconds from the running observation. A routing
+request starts one background refresh early enough to allow the previous measured
+scan duration before that point. Other callers immediately reuse the existing
+observation while it remains within the client's unchanged 150-second freshness
+window. The returned timestamp is never advanced; response validity ends at that
+observation's true freshness boundary. Cold or expired callers await the shared
+refresh. Cached-only reports never start a scan.
 Queued repositories and range branches progress concurrently under one global
-four-request gate. Snapshots expose elapsed time and the running-inventory
+three-request gate, including when only a few Namespace slots remain. Saturation
+still stops discovery and drains reads already in flight. Snapshot freshness is dated when running discovery begins,
+so queued discovery cannot make an old running count appear current. Snapshots expose elapsed time and the running-inventory
 request subtotal to distinguish request exhaustion from slow provider responses.
 
 Discovery stops after observing at least the requested `namespace_cap` distinct
-Namespace builds, or at the existing scan limit. The positive integer target
+Namespace builds, or when provider allowance or inventory completeness prevents continuing. The positive integer target
 (default twenty, maximum 10,000) follows the picker's configured admission cap.
 One organization snapshot is shared across targets: a complete inventory answers
 all caps, a sufficient lower bound answers smaller caps, and failures share one
@@ -634,12 +633,16 @@ through its configured destinations and native GitHub fallback. Logs show the
 lower bound, inventory coverage, cap state, and partial-scan reason.
 
 Refresh uses existing installation quota accounting, honors secondary cooldowns,
-leaves at least 1,500 core requests for repository work, and spends at most 2,400
-read attempts per rolling hour, including lost network responses on this operation. Brief request-slot
-contention yields within the scan deadline rather than invalidating the snapshot. A scan is bounded to
-96 requests, at most four simultaneous reads, and a 20-second launch window; individual requests retain their
-existing timeout. There is no alarm, CI event storage, or new polling task.
+leaves at least 1,500 core requests for repository work, and shares the installation
+provider accounting with other operations. Brief request-slot
+contention yields within each request's acquisition window rather than invalidating the snapshot. At most three reads run simultaneously; individual requests retain their existing timeout. There is no alarm, CI event storage, or new polling task.
 
 Pickers without a configured shared service retain bounded direct discovery.
 Shared-service failure or partial coverage never fans out into a direct scan
 from every picker. Visiting ordinary reports/status does not invoke capacity discovery.
+
+Capacity discovery has no independent pass cutoff. The existing three concurrent
+reads and actual shared provider quota controls still apply.
+A picker may stop waiting on its HTTP request; the installation object retains
+the shared scan with `waitUntil`, so a complete result can serve later pickers.
+Freshness checks and incomplete-inventory handling remain in force.

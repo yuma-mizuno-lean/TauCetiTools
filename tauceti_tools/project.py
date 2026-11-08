@@ -7,6 +7,8 @@ inherit the saved configuration path rather than fetching mutable online content
 
 from __future__ import annotations
 
+import copy
+import hashlib
 import json
 import os
 import re
@@ -18,6 +20,8 @@ import urllib.request
 from dataclasses import dataclass
 from pathlib import Path, PurePosixPath
 from typing import Any
+
+from .forge import GITHUB, resolve_repository
 
 try:
     import tomllib
@@ -62,9 +66,40 @@ class Project:
     raw: dict[str, Any]
     source: str = ""
 
+    def repository_ref(self, role: str):
+        """Qualified identity for new clients; v1 names retain GitHub semantics."""
+        return resolve_repository(self.raw["repositories"][role], self.raw.get("forges"))
+
+    def ci_repository_ref(self):
+        if "ci" not in self.raw:
+            raise ConfigError("No CI execution repository is configured in [ci]")
+        return resolve_repository(self.raw["ci"]["repository"], self.raw.get("forges"))
+
+    @property
+    def upstreams(self):
+        self._legacy_bindings()
+        return self.github_upstreams
+
+    @property
+    def github_upstreams(self):
+        """GitHub dependency operations, independent of the project's source forge."""
+        if any(resolve_repository(upstream["repo"], self.raw.get("forges")).forge != GITHUB
+               for upstream in self.raw.get("upstreams", [])):
+            raise ConfigError("This dependency operation requires explicitly configured GitHub upstreams")
+        return [{**upstream, "repo": resolve_repository(upstream["repo"], self.raw.get("forges")).name}
+                for upstream in self.raw.get("upstreams", [])]
+
+    def _legacy_bindings(self):
+        values = list(self.raw["repositories"].values())
+        values += [tool["repo"] for tool in self.raw.get("tools", {}).values()]
+        values += [upstream["repo"] for upstream in self.raw.get("upstreams", [])]
+        if any(resolve_repository(value, self.raw.get("forges")).forge != GITHUB for value in values):
+            raise ConfigError("This consumer uses GitHub-only bindings; use the qualified forge client before activating Forgejo")
+
     @property
     def repos(self) -> dict:
-        return self.raw["repositories"]
+        self._legacy_bindings()
+        return {role: self.repository_ref(role).name for role in self.raw["repositories"]}
 
     @property
     def content(self) -> str:
@@ -73,11 +108,14 @@ class Project:
     @property
     def key(self) -> str:
         # GitHub names are case-insensitive. This also works before repo creation.
-        return self.content.lower().replace("/", "__")
+        ref = self.repository_ref("content")
+        name = ref.name.lower().replace("/", "__")
+        return name if ref.forge == GITHUB else name + "__" + hashlib.sha256(ref.forge.key.encode()).hexdigest()[:16]
 
     @property
     def legacy(self) -> bool:
-        return self.content.lower() == CANONICAL.lower()
+        ref = self.repository_ref("content")
+        return ref.forge == GITHUB and ref.name.lower() == CANONICAL.lower()
 
     @property
     def branch(self) -> str:
@@ -85,18 +123,20 @@ class Project:
 
     @property
     def roots(self) -> list[str]:
-        return self.raw.get("lean", {}).get("roots", [self.content.split("/")[1]])
+        return self.raw.get("lean", {}).get("roots", [self.repository_ref("content").name.split("/")[1]])
 
     @property
     def roadmap_dir(self) -> str:
-        return self.raw.get("roadmap", {}).get("active_dir", self.repos["roadmap"].split("/")[1])
+        return self.raw.get("roadmap", {}).get("active_dir", self.repository_ref("roadmap").name.split("/")[1])
 
     @property
     def completed_dir(self) -> str:
         return self.raw.get("roadmap", {}).get("completed_dir", "Completed")
 
     def tool(self, name: str) -> dict:
-        return self.raw.get("tools", {}).get(name, {})
+        self._legacy_bindings()
+        value = self.raw.get("tools", {}).get(name, {})
+        return {**value, "repo": resolve_repository(value["repo"], self.raw.get("forges")).name} if value else {}
 
     def service(self, name: str) -> dict:
         return self.raw.get("services", {}).get(name, {"mode": "off"})
@@ -170,7 +210,7 @@ class Project:
             if self.service("bors").get("mode") != "off"
             else "",
             "TAUCETI_BORS_REPOSITORY_ID": str(self.service("bors").get("repository_id", "")),
-            "TAUCETI_UPSTREAMS": json.dumps(self.raw.get("upstreams", [])),
+            "TAUCETI_UPSTREAMS": json.dumps(self.upstreams),
         }
 
 
@@ -192,6 +232,33 @@ def parse(data: bytes, source: str = "") -> Project:
 
 
 def _validate(raw: dict, source: str) -> Project:
+    if type(raw.get("schema_version")) is int and raw.get("schema_version") == 2:
+        normalized = copy.deepcopy(raw)
+        connections = normalized.pop("forges", {})
+        ci = normalized.pop("ci", {})
+        try:
+            if not isinstance(connections, dict):
+                raise ValueError("forges must be a table")
+            for spec in connections.values():
+                resolve_repository({"forge": "check", "name": "check/check"}, {"check": spec})
+            for role, value in _table(normalized, "repositories").items():
+                normalized["repositories"][role] = resolve_repository(value, connections).name
+            for tool in _table(normalized, "tools").values():
+                if not isinstance(tool, dict):
+                    raise ValueError("tools must contain tables")
+                tool["repo"] = resolve_repository(tool.get("repo"), connections).name
+            for upstream in normalized.get("upstreams", []):
+                upstream["repo"] = resolve_repository(upstream.get("repo"), connections).name
+            if "ci" in raw:
+                if not isinstance(ci, dict) or set(ci) != {"backend", "repository"} or ci["backend"] != "github-actions":
+                    raise ValueError("ci requires backend = github-actions and repository")
+                if resolve_repository(ci["repository"], connections).forge.kind != "github":
+                    raise ValueError("github-actions requires a GitHub execution repository")
+        except (ValueError, TypeError, KeyError, AttributeError) as error:
+            raise ConfigError(str(error)) from error
+        normalized["schema_version"] = 1
+        _validate(normalized, source)
+        return Project(raw, source)
     allowed = {
         "schema_version",
         "project",
@@ -281,6 +348,10 @@ def _validate(raw: dict, source: str) -> Project:
                     raise ConfigError(f"services.{name}.{key} must be an HTTPS URL without credentials")
         if name == "bors" and value.get("deployment", "docker") not in ("docker", "cloudflare"):
             raise ConfigError("services.bors.deployment must be docker or cloudflare")
+        if name == "repair_cache" and "name" in value and (
+            not isinstance(value["name"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]*", value["name"])
+        ):
+            raise ConfigError("services.repair_cache.name must be a Lake cache service name (letters, digits, - and _)")
     for upstream in raw.get("upstreams", []):
         if not isinstance(upstream, dict):
             raise ConfigError("upstreams must be an array of tables")

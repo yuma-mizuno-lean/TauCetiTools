@@ -83,7 +83,8 @@ done
 # on a disposable trusted-base snapshot in a credential-free sandbox. Keep Tau Ceti's existing Mathlib-only path unchanged.
 # Split the canonical sentinel so project-template substitutions cannot rewrite it.
 canonical_repo="TauCetiProject/Tau""Ceti"
-if [ -n "${TAUCETI_CONF_SNAPSHOT:-}" ] && [ "${TAUCETI_REPO:-$canonical_repo}" != "$canonical_repo" ]; then
+if [ -n "${TAUCETI_CONF_SNAPSHOT:-}" ] \
+   && { [ "${TAUCETI_SOURCE_CANDIDATE:-}" = true ] || [ "${TAUCETI_REPO:-$canonical_repo}" != "$canonical_repo" ]; }; then
   exec python3 -m tauceti_tools upstreams guard --conf "$TAUCETI_CONF_SNAPSHOT" \
     --base "$BASE" --merge-base "$MERGE_BASE" --checkout "$PR"
 fi

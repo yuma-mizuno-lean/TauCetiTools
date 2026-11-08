@@ -473,24 +473,31 @@ export class InstallationScheduler extends DurableObject<Env> {
     if(!Number.isSafeInteger(namespaceTarget) || namespaceTarget<1 || namespaceTarget>10000)return json({error:'invalid_namespace_cap'},400);
     const organization=repo.name.split('/')[0],key='runner-capacity:'+organization;
     const answers=(value:any)=>value.namespace_discovery_target!==undefined && (value.complete!==true || value.routing_version===2 || value.placement_unavailable!=='capacity_namespace_target' || value.namespace_busy_lower_bound>=namespaceTarget);
-    // Reuse complete inventories and sufficient lower bounds across caps. An
-    // upgrade to a larger target uses the same organization cache and budget.
+    const fresh=(value:any,now=Date.now())=>value?.refresh_version===2 && value.complete===true &&
+      Number.isFinite(value.observed_at) && now-value.observed_at>=-5000 && now-value.observed_at<150000 && answers(value);
+    const refreshDue=(value:any,now=Date.now())=>now>=Math.max(value.observed_at,
+      Math.min(Number.isFinite(value.retry_at)?value.retry_at:Infinity,value.observed_at+145000)-Math.max(0,Number(value.elapsed_ms) || 0));
+    const serveFresh=(value:any)=>json({...value,cached:true,refreshing:!!this.capacityFlight,
+      // This is the client's real remaining freshness, not the refresh schedule.
+      retry_at:value.observed_at+150000});
+    let cached=await this.ctx.storage.get<any>(key);
+    if(cached?.complete!==true)cached=await this.ctx.storage.get<any>('runner-capacity-last-good:'+organization) || cached;
+    if(fresh(cached) && (this.capacityFlight || !refreshDue(cached)))return serveFresh(cached);
+    // Valid observations remain available while one demand-triggered refresh
+    // works in the background. Cold/expired observations still await that work.
     while(this.capacityFlight) {
       const value=await this.capacityFlight;
       if(value.organization===organization && answers(value))return json({cached:false,...value},value.complete?200:503);
     }
-    // Install the flight before the first storage await, so a finishing scan
-    // cannot race a caller that already read an expired value.
+    // Re-read storage after installing the flight. A caller that saw an old
+    // snapshot before another refresh finished must not repeat its discovery.
     this.capacityFlight ||= (async()=>{
       const saved=await this.ctx.storage.get<any>(key);
-      if(saved?.retry_at>Date.now() && answers(saved))return {...saved,cached:true};
-      // Retain the most informative requested target across refreshes, so mixed
-      // caps cannot multiply scans on every two-minute cache expiry.
+      // Earlier refresh policies could cache an artificial allowance failure
+      // for almost an hour. Ignore those decisions, retaining label/range caches.
+      if(saved?.refresh_version===2 && saved.retry_at>Date.now() && answers(saved) &&
+        (saved.complete!==true || fresh(saved) && !refreshDue(saved)))return {...saved,cached:true};
       const target=Math.max(namespaceTarget,saved?.namespace_discovery_target || 0);
-      const deadline=Date.now()+20000;
-      const attempts=await this.ctx.storage.get<number[]>('runner-capacity-attempts') || [];
-      const bootstrapKey='runner-capacity-label-bootstrap-v2:'+organization;
-      const bootstrap=await this.ctx.storage.get<{spent:number;done:boolean}>(bootstrapKey) || {spent:0,done:false};
       try {
         // Only immutable job labels and already-assigned identities are reused;
         // every scan still gets live job IDs/statuses. This is not job history.
@@ -525,26 +532,20 @@ export class InstallationScheduler extends DurableObject<Env> {
             this.ctx.storage.sql.exec('UPDATE runner_capacity_jobs SET seen_at=? WHERE key=?',Date.now(),key);
             return jobs;
           },
-          put:(key:string,revision:string,jobs:any[])=>{
+          put:(key:string,revision:string,jobs:any[],reusable=false)=>{
             this.ctx.storage.sql.exec('INSERT INTO runner_capacity_jobs VALUES(?,?,?,?) ON CONFLICT(key) DO UPDATE SET revision=excluded.revision,jobs=excluded.jobs,seen_at=excluded.seen_at',key,revision,JSON.stringify(jobs),Date.now());
           },
         };
         const token=await this.token(repo.installation);
-        const snapshot=await scanHostedCapacity(organization,async (path,body)=>{
+        const snapshot=await scanHostedCapacity(organization,async (path,body,context)=>{
           const api=body?'graphql':'core';
           const until=await this.ctx.storage.get<number>('secondary_until') || 0;
           if(until>Date.now() || this.usable('core')<=1500)throw new Error('capacity_quota_reserve');
           if(api==='graphql' && this.usable('graphql')<=1000)throw new Error('capacity_graphql_reserve');
-          while(attempts.length && attempts[0]<Date.now()-3600000)attempts.shift();
-          if(attempts.length>=2400)throw new Error('capacity_hourly_budget');
-          // Persist before launching: a lost network response still consumes allowance.
-          attempts.push(Date.now());await this.ctx.storage.put('runner-capacity-attempts',attempts);
-          if(!bootstrap.done) {
-            bootstrap.spent=Math.min(800,bootstrap.spent+1);
-            if(bootstrap.spent>=800)bootstrap.done=true;
-            await this.ctx.storage.put(bootstrapKey,bootstrap);
-          }
+          const deadline=Date.now()+20000;
           for(;;) {
+            if(this.usable('core')<=1500)throw new Error('capacity_quota_reserve');
+            if(api==='graphql' && this.usable('graphql')<=1000)throw new Error('capacity_graphql_reserve');
             try {return await this.http(path,token,body?'POST':'GET',body,'runner_capacity',api);}
             catch(error) {
               if(!(error instanceof QuotaDeferred) || error.result.category!=='capacity' || Date.now()+250>deadline)throw error;
@@ -554,24 +555,19 @@ export class InstallationScheduler extends DurableObject<Env> {
             }
           }
         },target,queuedCache);
-        if(snapshot.routing_version===2 && !bootstrap.done){bootstrap.done=true;await this.ctx.storage.put(bootstrapKey,bootstrap);}
-        // A 145-second cache permits at most 25 full scans per rolling hour:
-        // 25 * 96 attempts fits the unchanged 2400-attempt ceiling.
-        // Target upgrades also charge the same hard hourly attempt allowance.
-        // Active pickers can continue a productive partial pass after a shared
-        // cooldown. Keep both the per-pass and hourly provider budgets intact.
-        const continuing=snapshot.placement_unavailable==='capacity_scan_limit' && snapshot.job_cache_writes>0 &&
-          (!saved || snapshot.job_cache_hits>(saved.job_cache_hits || 0)) &&
-          (attempts.length<900 || !bootstrap.done && attempts.length<2208);
-        const value={complete:true,organization,namespace_discovery_target:target,...snapshot,retry_at:Date.now()+(continuing?30000:145000),coverage:snapshot.routing_version===2?'organization_repository_inventory':'organization_running_inventory'};
+        const value={complete:true,organization,refresh_version:2,namespace_discovery_target:target,...snapshot,retry_at:Math.max(Date.now()+1,snapshot.observed_at+145000),coverage:snapshot.routing_version===2?'organization_repository_inventory':'organization_running_inventory'};
         await this.ctx.storage.put(key,value);
         await this.ctx.storage.put('runner-capacity-last-good:'+organization,value);
         return value;
       } catch(error) {
-        const value={complete:false,organization,namespace_discovery_target:target,reason:error instanceof QuotaDeferred?'capacity_deferred':error instanceof Error && error.message.startsWith('capacity_')?error.message:classify(error),retry_at:Math.max(Date.now()+145000,error instanceof QuotaDeferred?error.result.retry_at || 0:0)};
+        const value={complete:false,organization,refresh_version:2,namespace_discovery_target:target,reason:error instanceof QuotaDeferred?'capacity_deferred':error instanceof Error && error.message.startsWith('capacity_')?error.message:classify(error),retry_at:Math.max(Date.now()+145000,error instanceof QuotaDeferred?error.result.retry_at || 0:0)};
         await this.ctx.storage.put(key,value);return value;
       }
     })().finally(()=>{this.capacityFlight=undefined;});
+    // Pickers retain their ordinary HTTP wait. A disconnect must not discard
+    // a valid shared scan just before it can publish the complete pool count.
+    this.ctx.waitUntil(this.capacityFlight);
+    if(fresh(cached))return serveFresh(cached);
     const value=await this.capacityFlight;return json({cached:false,...value},value.complete?200:503);
   }
   private releaseCapacityHints(count:number):void {

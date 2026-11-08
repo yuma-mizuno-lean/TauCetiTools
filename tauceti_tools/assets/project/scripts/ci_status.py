@@ -166,9 +166,12 @@ def scope_approved(api, record):
         endpoint = path if path.startswith("/") else f"repos/{record['repo']}/{path}"
         return api.request("GET", endpoint)
     try:
+        observe = lambda: bors_scope_approval.observation_with_admission(approval.get("batch_id"))
+        data, admission = observe()
         return bors_scope_approval.verify(
-            bors_scope_approval.observation(approval.get("batch_id")), approval["head"], approval["base"],
-            pr=approval.get("pr"), batch_id=approval.get("batch_id"), combined_paths=approval.get("paths"), api=read)
+            data, approval["head"], approval["base"], pr=approval.get("pr"),
+            batch_id=approval.get("batch_id"), combined_paths=approval.get("paths"),
+            api=read, admission=admission, refresh=observe)
     except (KeyError, TypeError, ValueError) as error:
         print(f"ci-status: scope approval unavailable: {type(error).__name__}", file=sys.stderr)
         return False
@@ -184,7 +187,7 @@ def status_snapshot(api, record):
     # governs it; an older row from a newer run must not override that ordering.
     for row in rows:
         context = row.get("context")
-        if isinstance(context, str) and context in CONTEXTS and context not in latest:
+        if isinstance(context, str) and (context in CONTEXTS or context.startswith("self-tested/")) and context not in latest:
             latest[context] = row
     return latest, len(rows) < 100
 
@@ -200,6 +203,16 @@ def timestamp(value):
 
 def newer_status(record, snapshot, started_at):
     latest, complete = snapshot
+    assertion = latest.get(f"self-tested/{record.get('pr')}")
+    if assertion and assertion.get("state") == "success":
+        url = assertion.get("target_url", "")
+        match = re.fullmatch(rf"https://github\.com/{re.escape(record['repo'])}/actions/runs/([1-9][0-9]*)", url)
+        if match and int(match[1]) > record["run_id"]:
+            try:
+                if timestamp(assertion.get("created_at")) > timestamp(started_at):
+                    return True  # A newer preflight replaced this ordinary build, including cancellation reports.
+            except ValueError:
+                return None
     row = latest.get(record["payload"]["context"])
     if row is None:
         return False if complete else None

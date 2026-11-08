@@ -8,6 +8,8 @@ import tempfile
 import unittest
 from pathlib import Path
 
+import yaml
+
 ROOT = Path(__file__).resolve().parents[1]
 WORKFLOW = ROOT / ".github/workflows/pr-build.yml"
 
@@ -136,6 +138,96 @@ else:
         self.assertEqual(calls, [])
         self.assertEqual(outputs, {})
 
+    def test_complete_source_fetch_is_separate_and_retains_known_identity_on_failure(self):
+        shell = shell_for("Fetch complete immutable source histories")
+        self.assertIn('exec python3 gate/scripts/ci_checkout.py fetch', shell)
+        self.assertNotIn('$(python3', shell)
+        report = shell_for("Report build and bump-guard statuses to the PR head commit")
+        self.assertLess(report.index('steps.source_fetch.outcome'), report.index('elif [ "$identity_ok" != 1 ]'))
+        for failed in (False, True):
+            with self.subTest(failed=failed), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                (root / "gate/scripts").mkdir(parents=True)
+                script = root / "gate/scripts/ci_checkout.py"
+                script.write_text(
+                    "import json,os,sys\nfrom pathlib import Path\n"
+                    'if os.environ.get("FETCH_FAIL"):sys.exit(7)\n'
+                    'assert sys.argv[1]=="fetch"\n'
+                    'assert sys.argv[sys.argv.index("--head")+1]=="a"*40\n'
+                    'with open(sys.argv[sys.argv.index("--github-env")+1],"a") as f:\n'
+                    ' f.write("CI_SOURCE_OBJECTS="+str(Path(os.environ["GITHUB_WORKSPACE"]).resolve()/".ci-source.git/objects")+"\\n")\n'
+                    'print(json.dumps({"store":str(Path(os.environ["GITHUB_WORKSPACE"]).resolve()/".ci-source.git")}))\n'
+                )
+                environment = root / "environment"
+                environment.write_text("existing=kept\n")
+                result = subprocess.run(
+                    ["bash", "-euo", "pipefail", "-c", shell],
+                    cwd=root,
+                    env={
+                        **os.environ,
+                        "GITHUB_WORKSPACE": str(root),
+                        "GITHUB_ENV": str(environment),
+                        "SOURCE_REPOSITORY": "owner/Project",
+                        "SOURCE_HEAD_REPOSITORY": "fork/Project",
+                        "SOURCE_HEAD": "a" * 40,
+                        "SOURCE_BASE": "b" * 40,
+                        "SOURCE_MERGEBASE": "c" * 40,
+                        "FETCH_FAIL": "1" if failed else "",
+                    },
+                    text=True,
+                    capture_output=True,
+                )
+                self.assertEqual(result.returncode, 7 if failed else 0, result.stderr)
+                text = environment.read_text()
+                self.assertNotIn("INFRA=1", text)
+                self.assertEqual("CI_SOURCE_OBJECTS=" in text, not failed)
+                self.assertIn("existing=kept", text)
+
+    def test_all_sandboxes_mount_source_objects_for_frozen_and_ordinary_candidates(self):
+        steps = yaml.safe_load(WORKFLOW.read_text())["jobs"]["sandboxed-build"]["steps"]
+        build = next(s["run"] for s in steps if s.get("id") == "build")
+        probes = [s["run"] for s in steps if "probe_mounts=(" in s.get("run", "")]
+        self.assertEqual(len(probes), 2)
+        for batch in ("true", "false"):
+            for text, name, end in [
+                (build, "object_mounts", "progress_observer=()"),
+                *((probe, "probe_mounts", "env -i /usr/bin/bwrap") for probe in probes),
+            ]:
+                with self.subTest(batch=batch, name=name), tempfile.TemporaryDirectory() as directory:
+                    root = Path(directory)
+                    for p in (
+                        root / ".ci-source.git/objects",
+                        root / "pr-raw-head/.git/objects",
+                        root / "base/.git/objects",
+                    ):
+                        p.mkdir(parents=True)
+                    start = text.index(name + "=(")
+                    # YAML has already removed indentation from the shell body.
+                    stop = text.find(end.strip(), start)
+                    self.assertGreater(stop, start)
+                    snippet = text[start:stop].replace("${{ env.IS_BATCH }}", batch)
+                    snippet += f'\nprintf "%s\\0" "${{{name}[@]}}"\n'
+                    result = subprocess.run(
+                        ["bash", "-euo", "pipefail", "-c", snippet],
+                        cwd=root,
+                        env={
+                            **os.environ,
+                            "CI_SOURCE_OBJECTS": str(root / ".ci-source.git/objects"),
+                            "CI_RESOURCE_EXPERIMENT": "0",
+                            "RUNNER_TEMP": str(root),
+                            "BASE_SHIM_REGISTRY": "",
+                            "BASE_SHIM_ROOT": "",
+                        },
+                        capture_output=True,
+                        check=True,
+                    )
+                    args = result.stdout.decode().split("\0")[:-1]
+                    self.assertEqual(
+                        args[:3],
+                        ["--ro-bind", str(root / ".ci-source.git/objects"), str(root / ".ci-source.git/objects")],
+                    )
+                    self.assertEqual(len(args), 3 if batch == "true" else 9)
+
     def test_retry_discovery_accepts_only_small_unique_original_run_intents(self):
         workflow = ROOT / ".github/workflows/retry-ci-status.yml"
         shell = shell_for("Discover retained intents from this exact original run", workflow)
@@ -250,6 +342,78 @@ class LintRepairIdentityTests(unittest.TestCase):
                            dict(event="merge_group"), dict(files="Project/Example.lean")]:
                 with self.subTest(author=author, change=change):
                     self.assertFalse(self.repair_flag(author, **change))
+
+
+class ParsingContextWorkflowTests(unittest.TestCase):
+    def test_pr_restores_context_before_candidate_execution_and_never_saves_it(self):
+        text = WORKFLOW.read_text()
+        restore = text.index("      - name: Restore dot-notation parsing context")
+        lint = text.index("      - name: Dot-notation namespace lint")
+        build = text.index("      - name: Build exact candidate under bwrap")
+        self.assertLess(restore, lint)
+        self.assertLess(lint, build)
+        self.assertIn("hashFiles('gate/scripts/lean_source.py')", text[restore:lint])
+        self.assertIn("steps.pr.outputs.base_sha", text[restore:lint])
+        self.assertIn('--context-cache ".ci-dot-notation-context/context.json"',
+                      shell_for("Dot-notation namespace lint (Mathlib type namespaces stay at root)"))
+        self.assertNotIn("Save main's dot-notation", text)
+
+    def test_template_saves_context_only_from_the_default_branch(self):
+        text = (ROOT / "tauceti_tools/assets/project/.github/workflows/ci.yml").read_text()
+        start = text.index("      - name: Save main's dot-notation parsing context")
+        step = text[start:].split("\n      - name:", 1)[0]
+        self.assertIn("if: github.ref_name == github.event.repository.default_branch", step)
+        self.assertIn("uses: actions/cache/save@v4", step)
+        self.assertIn("continue-on-error: true", step)
+        self.assertLess(start, text.index("      - name: Build\n"))
+        self.assertLess(start, text.index("      - name: Environment lint"))
+        self.assertIn("hashFiles('scripts/lean_source.py')", step)
+        self.assertIn('--context-cache ".ci-dot-notation-context/context.json"', text)
+
+
+class DotContextProducerTests(unittest.TestCase):
+    def test_main_produces_fresh_context_before_building(self):
+        workflow = ROOT / "tauceti_tools/assets/project/.github/workflows/ci.yml"
+        text = workflow.read_text()
+        self.assertNotIn("Restore dot-notation parsing context", text)
+        self.assertIn("rm -rf .ci-dot-notation-context", text)
+        self.assertLess(text.index("Save main's dot-notation parsing context"),
+                        text.index("      - name: Build"))
+        self.assertNotIn("Save main's dot-notation parsing context", WORKFLOW.read_text())
+
+
+class PreflightScopeTests(unittest.TestCase):
+    def test_pr_scope_and_full_gate_fallbacks(self):
+        for batch, bump, scoped, unmatched in [
+            (False, False, True, ""), (True, False, True, ""),
+            (False, True, True, ""), (False, False, False, ""),
+            (False, False, True, "web/Main.lean\n"),
+            (False, False, True, None),
+        ]:
+            with self.subTest(batch=batch, bump=bump, scoped=scoped, unmatched=unmatched):
+                with tempfile.TemporaryDirectory() as temp:
+                    root = Path(temp)
+                    modules = root / "modules"
+                    modules.write_text("TauCeti.Changed\n")
+                    if unmatched is not None:
+                        (root / "unmatched.txt").write_text(unmatched)
+                    envfile = root / "env"
+                    shell = shell_for("Decide the audit scope").replace(
+                        "${{ env.IS_BATCH }}", "true" if batch else "false")
+                    out = subprocess.run(["bash", "-euo", "pipefail", "-c", shell],
+                        text=True, capture_output=True, env={**os.environ,
+                        "GITHUB_ENV": str(envfile), "LINT_SCOPE_DIR": str(root),
+                        "LINT_ONLY_MODULES": str(modules) if scoped else "",
+                        "BUMP": "1" if bump else "0"})
+                    self.assertEqual(out.returncode, 0, out.stderr)
+                    values = dict(line.split("=", 1) for line in envfile.read_text().splitlines())
+                    fast = not batch and not bump and scoped and unmatched == ""
+                    self.assertEqual(values["LINT_CHANGED_ONLY"], "1" if fast else "0")
+                    self.assertEqual(values["AXIOMS_ONLY_MODULES"], str(modules) if fast else "")
+                    self.assertEqual(values["DOT_ONLY_MODULES"], str(modules) if fast else "")
+                    # Preserve the inventory for staging's downstream driver and
+                    # advisory declaration-name records, even when preflight is disabled.
+                    self.assertNotIn("LINT_ONLY_MODULES", values)
 
 
 if __name__ == "__main__":

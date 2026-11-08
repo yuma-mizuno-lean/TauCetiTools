@@ -61,15 +61,14 @@ function fixture(count=400,{sameSecond=false,repositories=1,runningCount=1,activ
  };
  return {read,cache,rows,saved,ranges,reads,extraNamespace,extraJobs,completed,promoted,generation,historical};
 }
-test('a 400-run mostly hosted queue converges under the 96-request bound',async()=>{
+test('a cold 400-run mostly hosted queue completes without an independent pass cutoff',async()=>{
  const f=fixture();let value,total=0,passes=0;
  do {
   value=await scanHostedCapacity('org',f.read,20,f.cache);total+=value.requests;passes++;
-  assert.ok(value.requests<=96);
   if(value.routing_version!==2){assert.equal(value.placement_unavailable,'capacity_scan_limit');assert.ok(value.job_cache_writes>0);}
  }while(value.routing_version!==2 && passes<12);
  assert.equal(value.routing_version,2);assert.equal(value.namespace_busy,4);assert.equal(value.busy,1);
- assert.equal(f.saved.size,401);assert.ok(passes>1);assert.ok(total<700);
+ assert.equal(f.saved.size,401);assert.equal(passes,1);assert.ok(total<700);
  f.reads.clear();const warm=await scanHostedCapacity('org',f.read,20,f.cache);
  assert.equal(warm.routing_version,2);assert.equal(warm.namespace_busy,4);assert.equal(warm.job_cache_hits,401);
  assert.equal(warm.job_cache_writes,0);assert.ok(warm.requests<25);
@@ -217,7 +216,7 @@ const ownerBundle=await build({entryPoints:['src/installation.ts'],bundle:true,f
  name:'owner-context',setup(b){b.onResolve({filter:/^cloudflare:workers$/},()=>({path:'context',namespace:'owner-context'}));b.onLoad({filter:/.*/,namespace:'owner-context'},()=>({contents:'export class DurableObject{constructor(ctx,env){this.ctx=ctx;this.env=env}}',loader:'js'}));}
 }]});
 const {InstallationScheduler}=await import('data:text/javascript;base64,'+Buffer.from(ownerBundle.outputFiles[0].text).toString('base64'));
-test('productive passes survive owner replacement, coalesce callers, respect cooldown and retain hourly quota',async()=>{
+test('productive passes survive owner replacement, coalesce callers, respect cooldown and ignore obsolete operation counters',async()=>{
  const f=fixture(400,{repositories:14,runningCount:45,activeCount:30}),db=new DatabaseSync(':memory:'),values=new Map();let calls=0;
  const storage={get:async key=>values.get(key),put:async(key,value)=>values.set(key,structuredClone(value)),sql:{exec(q,...args){
   let rows=[];
@@ -225,7 +224,7 @@ test('productive passes survive owner replacement, coalesce callers, respect coo
   else {const statement=db.prepare(q);if(statement.columns().length)rows=statement.all(...args);else statement.run(...args);}
   return {toArray:()=>rows,one:()=>{assert.equal(rows.length,1);return rows[0];}};
  }}};
- const make=()=>{const owner=new InstallationScheduler({storage},{});owner.token=async()=> 'token';owner.usable=()=>5000;
+ const make=()=>{const owner=new InstallationScheduler({storage,waitUntil(promise){promise.catch(()=>{});}},{});owner.token=async()=> 'token';owner.usable=()=>5000;
   owner.http=async(path,token,method,body)=>{calls++;return f.read(path,body);};return owner;};
  const original=Date.now;let clock=original();const started=clock;Date.now=()=>clock;
  try {
@@ -235,17 +234,15 @@ test('productive passes survive owner replacement, coalesce callers, respect coo
    const [first,second]=await Promise.all([get(),get()]);last=first;passes++;
    assert.equal(first.requests,second.requests);assert.equal(first.job_cache_writes,second.job_cache_writes);
    const count=calls;assert.equal((await get()).cached,true);assert.equal(calls,count);
-   if(first.routing_version!==2){assert.ok(first.retry_at>=clock+30000 && first.retry_at<=clock+31000);clock+=31000;}
+   if(first.routing_version!==2)clock=first.retry_at+1;
   }while(last.routing_version!==2 && passes<20);
   assert.equal(last.routing_version,2);assert.equal(last.namespace_busy,4);
   assert.equal(db.prepare('SELECT COUNT(*) n FROM runner_capacity_jobs').get().n,430);
-  assert.equal(values.get('runner-capacity-attempts').length,calls);
   const coldCalls=calls;
   while(clock<started+3600000) {
    clock+=31000;
    const current=await(await make().runnerCapacity({name:'org/repo',installation:'200'})).json();
    assert.equal(current.complete,true);assert.equal(current.routing_version,2);assert.equal(current.namespace_busy,4);
-   assert.ok(current.requests<=96);assert.ok(calls<2400);
   }
   console.log(JSON.stringify({repos:14,running_runs:45,queued_runs:400,cold_passes:passes,cold_requests:coldCalls,hour_requests:calls}));
   let count=calls;assert.equal((await(await make().runnerCapacity({name:'org/repo',installation:'200'})).json()).cached,true);assert.equal(calls,count);
@@ -255,8 +252,8 @@ test('productive passes survive owner replacement, coalesce callers, respect coo
   assert.equal(recovered.routing_version,2);assert.equal(recovered.namespace_busy,4);assert.equal(recovered.job_cache_writes,1);
   assert.doesNotThrow(()=>JSON.parse(db.prepare('SELECT jobs FROM runner_capacity_jobs WHERE key=?').get(key).jobs));count=calls;
   values.set('runner-capacity-attempts',Array(2400).fill(clock));clock+=146000;
-  const blocked=await(await make().runnerCapacity({name:'org/repo',installation:'200'})).json();
-  assert.equal(blocked.complete,false);assert.equal(blocked.reason,'capacity_hourly_budget');assert.equal(calls,count);
+  const refreshed=await(await make().runnerCapacity({name:'org/repo',installation:'200'})).json();
+  assert.equal(refreshed.routing_version,2);assert.ok(calls>count);
  }finally{Date.now=original;db.close();}
 });
 
@@ -282,7 +279,7 @@ test('warm production-sized discovery completes with measured provider-like late
  console.log(JSON.stringify({provider_latency_test_ms:v.elapsed_ms,requests:v.requests,peak_reads:peak}));
 });
 
-test('initial recovery can progress behind historical scan spending without changing the hourly ceiling',async()=>{
+test('initial recovery ignores obsolete operation-specific allowance records',async()=>{
  const f=fixture(400,{repositories:14,runningCount:45,activeCount:30}),db=new DatabaseSync(':memory:'),values=new Map();let calls=0;
  const original=Date.now;let clock=original();const started=clock;Date.now=()=>clock;
  values.set('runner-capacity-attempts',Array.from({length:1840},(_,i)=>started-3600000+i*3600000/1840));
@@ -291,18 +288,15 @@ test('initial recovery can progress behind historical scan spending without chan
   return {toArray:()=>rows,one:()=>{assert.equal(rows.length,1);return rows[0];}};
  }}};
  try {
-  let result,sawQuick=false;
+  let result;
   for(let i=0;i<25;i++) {
-   const owner=new InstallationScheduler({storage},{});owner.token=async()=> 'token';owner.usable=()=>5000;
+   const owner=new InstallationScheduler({storage,waitUntil(promise){promise.catch(()=>{});}},{});owner.token=async()=> 'token';owner.usable=()=>5000;
    owner.http=async(path,token,method,body)=>{calls++;return f.read(path,body);};
    result=await(await owner.runnerCapacity({name:'org/repo',installation:'200'})).json();
-   assert.ok(values.get('runner-capacity-attempts').length<=2400);
    if(result.routing_version===2)break;
-   if(result.retry_at-clock<=31000)sawQuick=true;
    clock=result.retry_at+1;
   }
-  assert.equal(result.routing_version,2);assert.equal(result.namespace_busy,4);assert.equal(sawQuick,true);
-  const bootstrap=values.get('runner-capacity-label-bootstrap-v2:org');assert.equal(bootstrap.done,true);assert.ok(bootstrap.spent<=800);
+  assert.equal(result.routing_version,2);assert.equal(result.namespace_busy,4);
   assert.ok(clock-started<15*60000);
   console.log(JSON.stringify({old_hour_requests:1840,new_requests:calls,bootstrap_ms:clock-started}));
  }finally{Date.now=original;db.close();}
@@ -346,4 +340,21 @@ test('other nonterminal check states retain REST fallback instead of hiding queu
   assert.equal(value.routing_version,2);assert.equal(value.namespace_busy,2);
  }
  assert.equal(f.reads.get(100),2);
+});
+
+test('a warm near-cap inventory keeps independent queued ranges parallel within the global gate',async()=>{
+ const f=fixture(700);const cold=await scanHostedCapacity('org',f.read,20,f.cache);assert.equal(cold.routing_version,2);
+ assert.ok(f.ranges.get('/repos/org/repo').length>2,'fixture must exercise independent stored ranges');
+ let queuedActive=0,queuedPeak=0,active=0,peak=0,calls=0,queuedListings=0;
+ const started=Date.now();
+ const value=await scanHostedCapacity('org',async(path,body)=>{
+  const listing=path.includes('status=queued');calls++;active++;peak=Math.max(peak,active);
+  if(listing){queuedListings++;queuedActive++;queuedPeak=Math.max(queuedPeak,queuedActive);}
+  try{await new Promise(resolve=>setTimeout(resolve,2));return await f.read(path,body);}
+  finally{active--;if(listing)queuedActive--;}
+ },6,f.cache);
+ assert.equal(value.routing_version,2);assert.equal(value.namespace_busy,4);assert.equal(value.job_cache_writes,0);
+ assert.equal(value.requests,calls);assert.equal(active,0);assert.ok(peak<=3);
+ console.log(JSON.stringify({queue:700,cap:6,namespace:value.namespace_busy,requests:calls,queued_listings:queuedListings,queued_listing_peak:queuedPeak,all_request_peak:peak,elapsed_ms:Date.now()-started}));
+ assert.equal(queuedPeak,3,'a nearly full pool still needs prompt complete discovery of its spare slots');
 });

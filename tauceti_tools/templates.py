@@ -137,14 +137,22 @@ def guard_app_jobs(text: str, *, runner: str = "ubuntu-latest") -> str:
     return before + "jobs:\n" + preflight + jobs
 
 
-def substitutions(project: Project) -> list[tuple[str, str]]:
+def repair_cache_url(project: Project) -> str:
+    """The repair cache's public read base, or empty when ``[services.repair_cache]`` is off."""
+    service = project.service("repair_cache")
+    if service.get("mode", "off") == "off":
+        return ""
+    return str(service.get("url", "")).rstrip("/")
+
+
+def substitutions(project: Project, *, source_ci=False) -> list[tuple[str, str]]:
     """Render only trusted tool templates, never contributor/agent content."""
     root = project.roots[0]
     if len(project.roots) != 1:
         raise ValueError(
             "This release's build harness supports one Lean library root; split the library or keep its existing custom build workflow"
         )
-    pairs = [
+    repository_pairs = [
         ("__MAINTENANCE_RUNNER__", MAINTENANCE_CONTROL_RUNNER if project.legacy else "ubuntu-latest"),
         ("TauCetiProject/TauCetiRoadmap", project.repos["roadmap"]),
         ("TauCetiProject/TauCetiReview", project.tool("review").get("repo", "TauCetiProject/TauCetiReview")),
@@ -156,8 +164,18 @@ def substitutions(project: Project) -> list[tuple[str, str]]:
         ("owner: TauCetiProject\n", "owner: " + project.content.split("/")[0] + "\n"),
         ("repositories: TauCeti\n", "repositories: " + project.content.split("/")[1] + "\n"),
         ("repositories: tauceti-claims\n", "repositories: " + project.repos.get("claims", "/").split("/")[1] + "\n"),
+    ] if not source_ci else [
+        ("https://github.com/" + CANONICAL, project.repository_ref("content").url),
+    ]
+    pairs = [
+        *repository_pairs,
         ("https://bors.taucetiproject.org", project.service("bors").get("url", "")),
         ("/repositories/1/active-batches", "/repositories/" + str(project.service("bors").get("repository_id", 1 if project.legacy else "")) + "/active-batches"),
+        # The repair worker's cache, read by staging CI (lake-cache-services.sh). Off renders an
+        # empty URL, which leaves the service undefined and the fetch a logged no-op.
+        ("https://repair-cache.taucetiproject.org", repair_cache_url(project)),
+        ('REPAIR_CACHE_SERVICE="tauceti-repair"',
+         'REPAIR_CACHE_SERVICE=' + json.dumps(project.service("repair_cache").get("name", "tauceti-repair"))),
         ("https://taucetiproject.github.io/TauCeti/docs", project.raw.get("publication", {}).get("docs_url", "")),
         ("roadmap_dir: TauCetiRoadmap", "roadmap_dir: " + project.roadmap_dir),
         ("lean_root: TauCeti", "lean_root: " + project.roots[0]),
@@ -188,10 +206,10 @@ def substitutions(project: Project) -> list[tuple[str, str]]:
     return pairs
 
 
-def render(text: str, project: Project) -> str:
+def render(text: str, project: Project, *, source_ci=False) -> str:
     import re
 
-    pairs = dict(substitutions(project))
+    pairs = dict(substitutions(project, source_ci=source_ci))
     pattern = re.compile("|".join(
         r"\bTauCeti\b" if key == "TauCeti" else
         re.escape(key) + r"(?![A-Za-z0-9_-])" if key == CANONICAL else re.escape(key)
@@ -199,7 +217,7 @@ def render(text: str, project: Project) -> str:
     return pattern.sub(lambda m: pairs[m.group()], text)
 
 
-def materialize(project: Project, destination: Path, *, policy_dir: Path | None = None):
+def materialize(project: Project, destination: Path, *, policy_dir: Path | None = None, source_ci=False):
     # Read policy first: local callers may materialize directly over scripts/.
     policies = (
         [
@@ -217,7 +235,7 @@ def materialize(project: Project, destination: Path, *, policy_dir: Path | None 
         target = destination / source.relative_to(ASSETS / "scripts")
         target.parent.mkdir(parents=True, exist_ok=True)
         try:
-            content = render(source.read_text(), project)
+            content = render(source.read_text(), project, source_ci=source_ci)
         except UnicodeError:
             shutil.copyfile(source, target)
         else:
@@ -246,7 +264,7 @@ def run_script(name: str, args: list[str], project: Project | None = None) -> in
         destination = Path(tempfile.mkdtemp(prefix="tauceti-scripts-"))
         materialize(project, destination, policy_dir=root / "scripts")
         executable = destination / name
-    command = ["python3", str(executable)] if executable.suffix == ".py" else ["bash", str(executable)]
+    command = [sys.executable, str(executable)] if executable.suffix == ".py" else ["bash", str(executable)]
     try:
         env = dict(os.environ)
         if project is not None:

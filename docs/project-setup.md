@@ -742,6 +742,26 @@ store it only in the trusted publication job; ordinary PR builds never publish s
 Use the configured repository identity in cache mappings. No downstream inherits Tau Ceti's
 writer credentials or bucket permissions.
 
+Dot-notation lint has a separate, optional parsing-context cache:
+
+```sh
+python3 scripts/lint-dot-notation.py --context-cache /trusted-cache/dot-notation/context.json
+```
+
+This stores Mathlib namespace components and TauCeti type-namespace ownership per source-content
+SHA-256. Each invocation inventories and hashes current source bytes, but parses only new contents;
+the base-tree ownership comparison uses the same entries. The parser's source hash, Python version, and Unicode tables invalidate
+the complete cache when parsing semantics change. Unknown or damaged formats fall back to parsing. Findings,
+baseline comparisons, and the full-lint fallback after ownership changes are always recomputed.
+
+The CI template creates the JSON directory (about 2 MB for TauCeti) from a fresh full scan,
+then saves it from the default branch before any library code executes. Main never restores it. Cache service failures do not
+block the build. The reusable PR build restores it before candidate execution and
+never publishes it. Treat it as trusted derived data, like a build cache: do not restore
+candidate-produced records or save from an untrusted PR run. Older entries remain useful because
+each source's content hash is checked independently. Removing the flag restores uncached behavior.
+To abandon existing snapshots, increment `dot-notation-context-v1` in both workflow keys.
+
 ## Bors
 
 Bors is always operated by the downstream. `hosted` supplies its PostgreSQL database as a
@@ -1316,3 +1336,24 @@ of this access.
 The review spend and round ledger lives on the `reviews` branch of the content repository,
 or the configured Data repository when one is declared. This state persists even with optional
 review archiving off; the automation App needs contents write permission on that repository.
+
+## PR lint preflight and staging verification
+
+Ordinary PR builds set `LINT_CHANGED_ONLY=1` with a trusted, read-only
+`LINT_ONLY_MODULES` list from the exact candidate diff. Environment linters,
+docstrings, declaration-level `nolint` checks and source style check changed modules.
+Docstrings are calibrated against an independently imported Mathlib declaration even
+when the selected modules have no documented declarations. Findings use defining-module
+ownership, so imported declarations remain outside the preflight scope.
+
+Staging and merge-queue builds, `full-lint` PRs, dependency changes and uncertain module
+scope disable changed-only preflight. Environment lint retains its existing changed-module
+scope plus downstream `unusedArguments`; `full-lint`, repair PRs and unknown scope select every
+module. Global docstring and source-style checks retain coverage floors and sentinels,
+baseline visibility and complete suppression inventories. Nightly verification and the
+full-lint repair workflow remain in place.
+Ordinary PRs do not report out-of-scope baseline or suppression entries as fixed.
+
+Local scoped lint retains its existing downstream and global-docstring behavior unless
+`LINT_CHANGED_ONLY=1` is explicitly set. To reproduce PR preflight locally, pass both variables;
+to reproduce staging, unset both and run `scripts/lint-env.sh` and `scripts/lint-style.sh`.
