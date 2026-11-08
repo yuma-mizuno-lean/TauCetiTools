@@ -49,7 +49,7 @@ class Selection(unittest.TestCase):
         self.assertTrue(all("tauceti-fleet-pr" in r["labels"] and "fleet-" + "b" * 32 in r["labels"] for r in pr))
         self.assertEqual(pr[0]["runner_id"], 2)
 
-    def test_pr_and_staging_share_machine_capacity_and_reservations_are_not_double_counted(self):
+    def test_busy_and_reserved_instances_are_unavailable(self):
         machines, pages = self.ranked_fixture()
         pages[0]["runners"][0]["busy"] = True
         result = ranked_runners(pages, kind="staging", machines=machines, reserved=[3])
@@ -65,6 +65,33 @@ class Selection(unittest.TestCase):
                          github_budget=18, namespace_cap=20, selection_key=key)
         self.assertEqual({select(str(n), [])["runner_id"] for n in range(8)}, {2, 3})
         self.assertEqual(select("1", None)["pool"], "chris")
+
+    def test_staging_uses_reserved_guest_before_shared_guest_for_every_selection_key(self):
+        machines, pages = self.ranked_fixture()
+        machine = dict(machines[1], max_jobs=2)
+        shared, dedicated = pages[0]["runners"][0], pages[0]["runners"][2]
+        # The shared guest has the older/lower ID, matching the production case.
+        shared["id"], dedicated["id"] = 2, 3
+        dedicated["labels"] = [label for label in dedicated["labels"] if label["name"] != "tauceti-fleet-pr"]
+        pages = [dict(total_count=2, runners=[shared, dedicated])]
+        def select(kind="staging", key="", queued=()):
+            return route(kind=kind, order=["chris", "namespace"], machines={"chris": machine},
+                         runner_pages=pages, observed=dict(github_busy=0, namespace_busy=0, queued_fleet=list(queued)),
+                         github_budget=18, namespace_cap=20, selection_key=key)
+        for key in map(str, range(32)):
+            self.assertEqual(select(key=key)["runner_id"], 3)
+        self.assertEqual(select("pr")["runner_id"], 2)
+        # Old dispatcher settings cannot hide a registered staging reservation.
+        machine.update(max_jobs=1, kinds=["pr"])
+        self.assertEqual(select()["runner_id"], 3)
+        dedicated["busy"] = True
+        self.assertEqual(select()["runner_id"], 2)
+        dedicated["busy"] = False
+        dedicated["status"] = "offline"
+        self.assertEqual(select()["runner_id"], 2)
+        dedicated["status"] = "online"
+        target = {label["name"] for label in dedicated["labels"]}
+        self.assertEqual(select(queued=[target])["runner_id"], 2)
 
     def test_legacy_labels_partial_inventories_and_ambiguous_instances_cannot_authorize_a_slot(self):
         machines, pages = self.ranked_fixture()
@@ -94,7 +121,37 @@ class Selection(unittest.TestCase):
         self.assertEqual(select("pr", 19, 19)["pool"], "namespace")
         self.assertEqual(select("pr", 19, 20), dict(pool="github", waiting=True))
 
-    def test_queued_exact_targets_count_against_shared_machine_capacity(self):
+    def test_expanded_brett_capacity_keeps_other_ready_machines_available(self):
+        machines, pages = self.ranked_fixture()
+        machines[1].update(name="brett", max_jobs=24)
+        for guest in pages[0]["runners"]:
+            if guest["id"] in (2, 3):
+                guest["labels"].append(dict(name="fleet-host-brett-server"))
+        config = {"tauchonki": machines[0], "brett": dict(enrollment_name="brett-server", max_jobs=24, kinds=["pr", "staging"])}
+        def select():
+            return route(kind="staging", order=["tauchonki", "brett", "namespace", "github"], machines=config,
+                         runner_pages=pages, observed=dict(github_busy=20, namespace_busy=20, queued_fleet=[]),
+                         github_budget=12, namespace_cap=20)
+        self.assertEqual(select()["pool"], "tauchonki")
+        pages[0]["runners"][1]["busy"] = True
+        self.assertEqual(select()["pool"], "brett")
+
+    def test_registered_capacity_and_classes_override_stale_or_missing_dispatcher_limits(self):
+        machines, _ = self.ranked_fixture()
+        machine = dict(machines[1], name="brett", max_jobs=2, kinds=["staging"])
+        def guest(identity, busy=False):
+            return dict(runner(busy=busy, labels=["self-hosted", "linux", "x64", "fleet-" + machine["machine_id"],
+                "fleet-instance-" + f"{identity:016x}", "tauceti-fleet-pr", "tauceti-fleet-staging"]), id=identity)
+        rows = [guest(n, n <= 2) for n in range(1, 25)]
+        pages = [dict(total_count=len(rows), runners=rows)]
+        # Both classes use all 21 idle, unreserved runners though the old cap is full
+        # and the old class list says staging only.
+        for config in [machine, {k: machine[k] for k in ("name", "machine_id")}]:
+            for kind in ("pr", "staging"):
+                ready = ranked_runners(pages, kind=kind, machines=[config], reserved=[3])
+                self.assertEqual([r["runner_id"] for r in ready], list(range(4, 25)))
+
+    def test_queued_exact_targets_exclude_their_registered_instances(self):
         machines, pages = self.ranked_fixture()
         queued = [{label["name"] for label in r["labels"]} for r in pages[0]["runners"] if r["id"] in (2, 3)]
         selected = route(kind="pr", order=["github", "chris", "namespace"], machines={m["name"]: m for m in machines},
@@ -194,6 +251,7 @@ class RoutingEntrypoint(unittest.TestCase):
 
     def pick(self, fixtures, *, config=None, **overrides):
         calls = []
+        shared_urls = []
         class Response(io.BytesIO):
             headers = {}
         class Opener:
@@ -201,6 +259,8 @@ class RoutingEntrypoint(unittest.TestCase):
                 token = request.get_header("Authorization").removeprefix("Bearer ")
                 path = "shared" if request.full_url.startswith("https://github-state.taucetiproject.org/") else request.full_url.removeprefix("https://api.github.com/")
                 calls.append((token, path))
+                if path == "shared":
+                    shared_urls.append(request.full_url)
                 value = fixtures[token][path]
                 if callable(value):
                     value = value()
@@ -222,8 +282,10 @@ class RoutingEntrypoint(unittest.TestCase):
             before = Path.cwd()
             try:
                 os.chdir(root)
-                with patch.dict(os.environ, environment, clear=True), patch.object(fleet_runner.urllib.request, "build_opener", return_value=Opener()), redirect_stdout(io.StringIO()):
+                with patch.dict(os.environ, environment, clear=True), patch.object(fleet_runner.urllib.request, "build_opener", return_value=Opener()), redirect_stdout(io.StringIO()) as captured:
                     fleet_runner.route_main()
+                    self.last_log = captured.getvalue()
+                    self.last_shared_urls = shared_urls
             finally:
                 os.chdir(before)
             return dict(line.split("=", 1) for line in output.read_text().splitlines()), calls
@@ -271,7 +333,7 @@ class RoutingEntrypoint(unittest.TestCase):
         self.assertEqual(output["pool"], "chris")
         self.assertEqual([token for token, _ in calls], ["state", "fleet"])
 
-    def test_unknown_earlier_cloud_is_observed_before_later_available_machine(self):
+    def test_unknown_cloud_does_not_delay_an_available_machine_with_another_scan(self):
         config, inventory = self.staging_fixture()
         config = config.replace('[services.fleet]\n', '[services.fleet]\npr_order=["namespace","chris","github"]\n')
         output, calls = self.pick(dict(
@@ -279,8 +341,8 @@ class RoutingEntrypoint(unittest.TestCase):
             fleet={"orgs/Test/actions/runner-groups/3/runners?per_page=100&page=1": inventory},
         ), config=config, FLEET_CI_ENABLED="true", FLEET_READ_TOKEN="fleet", FLEET_RUNNER_GROUP_ID="3",
            GITHUB_STATE_TOKEN="state")
-        self.assertEqual(output["pool"], "namespace")
-        self.assertIn(("app", "orgs/Test/repos?per_page=100&page=1"), calls)
+        self.assertEqual(output["pool"], "chris")
+        self.assertFalse(any(token == "app" for token, _ in calls))
 
     def test_available_first_cloud_does_not_fetch_unneeded_fleet_inventory(self):
         config, inventory = self.staging_fixture()
@@ -391,13 +453,80 @@ class RoutingEntrypoint(unittest.TestCase):
         self.assertEqual(output["namespace_busy"], "20")
         self.assertEqual(calls, [("state", "shared")])
 
-    def test_stale_wrong_org_invalid_and_oversized_shared_values_use_direct_fallback(self):
+    def test_partial_shared_capacity_never_asserts_namespace_spare_capacity(self):
+        for kind, busy in [("pr", 20), ("staging", 0), ("other", 20)]:
+            for lower, pool in [(0, "github"), (16, "github"), (20, "github"), (None, "github")]:
+                with self.subTest(kind=kind, lower=lower):
+                    value = self.shared(busy=busy, namespace_busy_lower_bound=lower)
+                    output, calls = self.pick(dict(state=dict(shared=value)), GITHUB_STATE_TOKEN="state", BUDGET="12", FLEET_JOB_KIND=kind)
+                    self.assertEqual(output["pool"], pool)
+                    self.assertEqual(output["namespace_busy"], "")
+                    self.assertEqual(calls, [("state", "shared")])
+                    self.assertIn("inventory=partial" if lower is not None else "inventory=unavailable", self.last_log)
+                    self.assertIn("cap reached" if lower == 20 else "capacity unknown", self.last_log)
+                    self.assertIn(f">={lower}/20" if lower is not None else "unknown/20", self.last_log)
+
+        for lower in [True, "0", -1, 10001]:
+            with self.subTest(invalid_lower=lower):
+                output, calls = self.pick(dict(state=dict(shared=self.shared(busy=20, namespace_busy_lower_bound=lower))), GITHUB_STATE_TOKEN="state")
+                self.assertEqual(output["pool"], "github")
+                self.assertEqual(output["busy"], "20")
+                self.assertEqual(calls, [("state", "shared")])
+
+    def test_complete_namespace_count_below_configured_cap_keeps_preference_order(self):
+        for count in (0, 16, 19):
+            snapshot = self.shared(busy=20, routing_version=2, namespace_busy=count, queued_fleet=[])
+            output, calls = self.pick(dict(state=dict(shared=snapshot)), GITHUB_STATE_TOKEN="state", BUDGET="12")
+            self.assertEqual(output["pool"], "namespace")
+            self.assertIn(f"{count}/20; inventory=complete; capacity available", self.last_log)
+            self.assertEqual(calls, [("state", "shared")])
+
+    def test_saturated_lower_bound_reports_reason_and_keeps_later_idle_machine(self):
+        config, inventory = self.staging_fixture()
+        config = config.replace('[services.fleet]\n', '[services.fleet]\npr_order=["namespace","chris","github"]\n')
+        snapshot = self.shared(busy=20, namespace_busy_lower_bound=22, placement_unavailable="capacity_namespace_target")
+        output, calls = self.pick(dict(state=dict(shared=snapshot),
+            fleet={"orgs/Test/actions/runner-groups/3/runners?per_page=100&page=1": inventory}),
+            config=config, FLEET_CI_ENABLED="true", FLEET_READ_TOKEN="fleet", FLEET_RUNNER_GROUP_ID="3", GITHUB_STATE_TOKEN="state")
+        self.assertEqual(output["pool"], "chris")
+        self.assertEqual(output["namespace_busy_lower_bound"], "22")
+        self.assertEqual(output["placement_unavailable"], "capacity_namespace_target")
+        self.assertIn(">=22/20; inventory=partial; cap reached; reason=capacity_namespace_target", self.last_log)
+        self.assertFalse(any(token in ("app", "repository") for token, _ in calls))
+
+    def test_requested_cap_is_used_for_discovery_and_admission(self):
+        for cap, count, expected in [(8, 7, "namespace"), (8, 8, "github"), (30, 20, "namespace"), (30, 30, "github")]:
+            snapshot = self.shared(busy=20, routing_version=2, namespace_busy=count, queued_fleet=[])
+            output, _ = self.pick(dict(state=dict(shared=snapshot)), GITHUB_STATE_TOKEN="state", BUDGET="12", NAMESPACE_BUILD_CAP=str(cap))
+            self.assertEqual(output["pool"], expected)
+            self.assertIn(f"namespace_cap={cap}", self.last_shared_urls[0])
+            self.assertIn(f"{count}/{cap}; inventory=complete", self.last_log)
+
+    def test_partial_fleet_reservations_exclude_observed_targets(self):
+        config, inventory = self.staging_fixture()
+        queued = [[v["name"] for v in inventory["runners"][1]["labels"]]]
+        snapshot = self.shared(namespace_busy_lower_bound=20, queued_fleet=queued)
+        output, _ = self.pick(dict(state=dict(shared=snapshot),
+            fleet={"orgs/Test/actions/runner-groups/3/runners?per_page=100&page=1": inventory}), config=config,
+            FLEET_JOB_KIND="staging", FLEET_CI_ENABLED="true", FLEET_READ_TOKEN="fleet", FLEET_RUNNER_GROUP_ID="3", GITHUB_STATE_TOKEN="state")
+        self.assertEqual(output["pool"], "chris")
+
+    def test_partial_reason_cannot_inject_workflow_outputs(self):
+        for reason in ["capacity_scan_limit\nrunner=wrong", "::warning::bad", {"message": "failure"}, 1, "capacity_" + "x" * 65]:
+            snapshot = self.shared(namespace_busy_lower_bound=20, placement_unavailable=reason)
+            output, _ = self.pick(dict(state=dict(shared=snapshot)), GITHUB_STATE_TOKEN="state", BUDGET="12")
+            self.assertEqual(output["pool"], "github")
+            self.assertEqual(output["placement_unavailable"], "")
+            self.assertNotIn("reason=", self.last_log)
+            self.assertNotEqual(output["runner"], "wrong")
+
+    def test_invalid_shared_values_keep_native_fallback_without_duplicate_scans(self):
         for changes in [dict(observed_at=0), dict(observed_at=time.time()*1000-160000), dict(organization="Other"), dict(busy=True),
                         dict(observed_at=float("nan")), dict(retry_at=0), dict(routing_version=2, namespace_busy=-1, queued_fleet=[])]:
             with self.subTest(changes=changes):
                 output, calls = self.pick(dict(state=dict(shared=self.shared(**changes)), app=self.fixture()), GITHUB_STATE_TOKEN="state")
                 self.assertEqual(output["pool"], "github")
-                self.assertIn(("app", "rate_limit"), calls)
+                self.assertEqual(calls, [("state", "shared")])
 
     def test_real_api_link_pagination_accepts_live_actions_count_drift(self):
         fixtures = self.fixture()

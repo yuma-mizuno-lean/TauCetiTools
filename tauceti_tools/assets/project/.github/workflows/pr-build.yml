@@ -1,4 +1,6 @@
 name: pr-build
+# GitHub evaluates the caller title; recovery associates dispatches on main with their PR.
+run-name: ${{ github.event_name == 'repository_dispatch' && github.event.action == 'tauceti-bors-staging' && format('bors branch={0} batch={1} head={2} base={3}', github.event.client_payload.base_ref || 'unknown', github.event.client_payload.batch_id, github.event.client_payload.head_sha, github.event.client_payload.base_sha) || format('pr-build {0}', github.event.pull_request.number || inputs.pr || github.event.client_payload.pr || github.event.merge_group.head_sha || github.run_id) }}
 on:
   pull_request_target:
     types: [opened, synchronize, reopened]
@@ -17,6 +19,7 @@ on:
   workflow_dispatch:
     inputs:
       pr: { description: "PR number to build", required: true, type: string }
+      maintenance: { description: "Prioritized maintenance recovery build", type: boolean, default: false }
 
 permissions:
   contents: read
