@@ -196,4 +196,6 @@ unsafe def main (args : List String) : IO UInt32 := do
   else
     IO.print (diagnostic s!"{report}\n-- All linting checks passed!")
   IO.println (← IO.FS.readFile markerFile).trimAscii.toString
-  return if failed then 1 else 0
+  (← IO.getStdout).flush
+  (← IO.getStderr).flush
+  IO.Process.exit (if failed then 1 else 0)
